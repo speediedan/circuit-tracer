@@ -100,6 +100,7 @@ def attribute(
     offload: Literal["cpu", "disk", None] = None,
     verbose: bool = False,
     update_interval: int = 4,
+    entailment_indices: torch.Tensor | None = None,
 ) -> Graph:
     """Compute an attribution graph for *prompt*.
 
@@ -146,6 +147,7 @@ def attribute(
             offload_handles=offload_handles,
             update_interval=update_interval,
             logger=logger,
+            entailment_indices=entailment_indices,
         )
     finally:
         for reload_handle in offload_handles:
@@ -167,6 +169,7 @@ def _run_attribution(
     offload_handles,
     logger,
     update_interval=4,
+    entailment_indices: torch.Tensor | None = None,
 ):
     start_time = time.time()
     # Phase 0: precompute
@@ -201,12 +204,19 @@ def _run_attribution(
     n_layers, n_pos, _ = activation_matrix.shape
     total_active_feats = activation_matrix._nnz()
 
-    logit_idx, logit_p, logit_vecs = compute_salient_logits(
-        ctx.logits[0, -1],
-        model.unembed.W_U,
-        max_n_logits=max_n_logits,
-        desired_logit_prob=desired_logit_prob,
-    )
+    if entailment_indices is not None:
+        logit_idx, logit_p, logit_vecs = compute_specific_logits(
+            logits[0, -1],
+            model.unembed.W_U,
+            entailment_indices=entailment_indices,
+        )
+    else:
+        logit_idx, logit_p, logit_vecs = compute_salient_logits(
+            logits[0, -1],
+            model.unembed.W_U,
+            max_n_logits=max_n_logits,
+            desired_logit_prob=desired_logit_prob,
+        )
     logger.info(
         f"Selected {len(logit_idx)} logits with cumulative probability {logit_p.sum().item():.4f}"
     )
@@ -256,6 +266,8 @@ def _run_attribution(
         if max_feature_nodes == total_active_feats:
             pending = torch.arange(total_active_feats)
         else:
+            # TODO: consider evaluating tradeoff of computing this once outside of the while loop rather
+            # than recalculating with every updated batch
             influences = compute_partial_influences(
                 edge_matrix[:st], logit_p, row_to_node_index[:st]
             )
