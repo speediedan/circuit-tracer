@@ -34,6 +34,34 @@ from circuit_tracer.utils.disk_offload import offload_modules
 
 
 @torch.no_grad()
+def compute_specific_logits(
+    logits: torch.Tensor,
+    unembed_proj: torch.Tensor,
+    *,
+    analysis_target_indices: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Select specific logits and their unembedding vectors.
+
+    Args:
+        logits: ``(d_vocab,)`` vector (single position).
+        unembed_proj: ``(d_model, d_vocab)`` unembedding matrix.
+        analysis_target_indices: Tensor of indices to select from logits.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            * logit_indices - ``(k,)`` vocabulary ids.
+            * logit_probs   - ``(k,)`` softmax probabilities.
+            * demeaned_vecs - ``(k, d_model)`` unembedding columns, demeaned.
+    """
+
+    probs = torch.softmax(logits, dim=-1)
+    analysis_target_probs = probs[analysis_target_indices]
+    cols = unembed_proj[:, analysis_target_indices]
+    demeaned = cols - unembed_proj.mean(dim=-1, keepdim=True)
+    return analysis_target_indices, analysis_target_probs, demeaned.T
+
+
+@torch.no_grad()
 def compute_salient_logits(
     logits: torch.Tensor,
     unembed_proj: torch.Tensor,
@@ -100,7 +128,7 @@ def attribute(
     offload: Literal["cpu", "disk", None] = None,
     verbose: bool = False,
     update_interval: int = 4,
-    entailment_indices: torch.Tensor | None = None,
+    analysis_target_indices: torch.Tensor | None = None,
 ) -> Graph:
     """Compute an attribution graph for *prompt*.
 
@@ -147,7 +175,7 @@ def attribute(
             offload_handles=offload_handles,
             update_interval=update_interval,
             logger=logger,
-            entailment_indices=entailment_indices,
+            analysis_target_indices=analysis_target_indices,
         )
     finally:
         for reload_handle in offload_handles:
@@ -169,7 +197,7 @@ def _run_attribution(
     offload_handles,
     logger,
     update_interval=4,
-    entailment_indices: torch.Tensor | None = None,
+    analysis_target_indices: torch.Tensor | None = None,
 ):
     start_time = time.time()
     # Phase 0: precompute
@@ -204,15 +232,15 @@ def _run_attribution(
     n_layers, n_pos, _ = activation_matrix.shape
     total_active_feats = activation_matrix._nnz()
 
-    if entailment_indices is not None:
+    if analysis_target_indices is not None:
         logit_idx, logit_p, logit_vecs = compute_specific_logits(
-            logits[0, -1],
+            ctx.logits[0, -1],
             model.unembed.W_U,
-            entailment_indices=entailment_indices,
+            analysis_target_indices=analysis_target_indices,
         )
     else:
         logit_idx, logit_p, logit_vecs = compute_salient_logits(
-            logits[0, -1],
+            ctx.logits[0, -1],
             model.unembed.W_U,
             max_n_logits=max_n_logits,
             desired_logit_prob=desired_logit_prob,
