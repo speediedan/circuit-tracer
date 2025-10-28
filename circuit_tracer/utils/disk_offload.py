@@ -2,6 +2,7 @@ import atexit
 import os
 import tempfile
 from typing import Literal
+import torch
 
 from safetensors.torch import load_file, save_file
 
@@ -52,6 +53,17 @@ def cpu_offload_module(module):
     return reload_handle
 
 
-def offload_modules(modules, offload_type: Literal["cpu", "disk"]):
+def offload_modules(
+    modules: list | torch.nn.Module | torch.nn.ModuleList | torch.nn.ModuleDict | torch.nn.Sequential,
+    offload_type: Literal["cpu", "disk"],
+) -> list:
     offload_fn = disk_offload_module if offload_type == "disk" else cpu_offload_module
-    return [offload_fn(module) for module in modules]
+
+    container_types = (torch.nn.ModuleList, torch.nn.ModuleDict, torch.nn.Sequential)
+    if isinstance(modules, container_types):
+        mods = modules.values() if isinstance(modules, torch.nn.ModuleDict) else modules
+        return [offload_fn(module) for module in mods]
+    if isinstance(modules, list):
+        return [offload_fn(module) for module in modules]
+
+    return [offload_fn(modules)]
