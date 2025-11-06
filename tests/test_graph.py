@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 import torch
 from transformer_lens import HookedTransformerConfig
 
@@ -204,8 +205,27 @@ def test_graph_with_tensor_logit_targets():
     assert graph_tensor.vocab_size == graph_list.vocab_size
 
 
-def test_graph_serialization_with_tensor_logit_targets():
-    """Test that Graph serialization works with tensor logit_targets format."""
+@pytest.mark.parametrize(
+    "logit_targets_input,expected_token_strs",
+    [
+        pytest.param(
+            torch.tensor([262, 290, 314]),
+            ["", "", ""],
+            id="tensor_format",
+        ),
+        pytest.param(
+            [
+                LogitTarget(token_str=" the", vocab_idx=262),
+                LogitTarget(token_str=" a", vocab_idx=290),
+                LogitTarget(token_str=" and", vocab_idx=314),
+            ],
+            [" the", " a", " and"],
+            id="logit_target_format",
+        ),
+    ],
+)
+def test_graph_serialization_with_logit_targets(logit_targets_input, expected_token_strs):
+    """Test that Graph serialization works with both tensor and LogitTarget formats."""
     import tempfile
     import os
 
@@ -227,14 +247,14 @@ def test_graph_serialization_with_tensor_logit_targets():
     adjacency_matrix = torch.zeros([10, 10])
     adjacency_matrix[9, 5] = 1.0
 
-    # Create graph with tensor format
+    # Create graph with parameterized format
     original_graph = Graph(
         input_string="test",
         input_tokens=torch.tensor([1, 2, 3]),
         active_features=torch.tensor([[0, 0, 5]]),
         adjacency_matrix=adjacency_matrix,
         cfg=cfg,
-        logit_targets=torch.tensor([262, 290, 314]),
+        logit_targets=logit_targets_input,
         logit_probabilities=torch.tensor([0.5, 0.3, 0.2]),
         selected_features=torch.tensor([0]),
         activation_values=torch.tensor([1.5]),
@@ -256,12 +276,12 @@ def test_graph_serialization_with_tensor_logit_targets():
         assert torch.equal(loaded_graph.logit_token_ids, torch.tensor([262, 290, 314]))
         assert torch.equal(loaded_graph.logit_probabilities, torch.tensor([0.5, 0.3, 0.2]))
 
-        # Verify LogitTarget objects were preserved with empty token strings
+        # Verify LogitTarget objects were preserved with expected token strings
         assert len(loaded_graph.logit_targets) == 3
         assert all(isinstance(lt, LogitTarget) for lt in loaded_graph.logit_targets)
-        assert loaded_graph.logit_targets[0].token_str == ""
-        assert loaded_graph.logit_targets[1].token_str == ""
-        assert loaded_graph.logit_targets[2].token_str == ""
+        assert loaded_graph.logit_targets[0].token_str == expected_token_strs[0]
+        assert loaded_graph.logit_targets[1].token_str == expected_token_strs[1]
+        assert loaded_graph.logit_targets[2].token_str == expected_token_strs[2]
 
     finally:
         if os.path.exists(tmp_path):
