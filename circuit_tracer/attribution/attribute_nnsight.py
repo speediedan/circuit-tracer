@@ -285,7 +285,7 @@ def _run_attribution(
     full_edge_matrix[-n_logits:] = edge_matrix[actual_max_feature_nodes:]
 
     graph = Graph(
-        input_string=model.tokenizer.decode(input_ids),
+        input_string=str(model.tokenizer.decode(input_ids)),
         input_tokens=input_ids,
         attribution_targets=targets,
         active_features=activation_matrix.indices().T,
