@@ -7,6 +7,4 @@ def get_default_device() -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-__all__ = [
-    "create_graph_files",
-]
+__all__ = ["create_graph_files", "get_default_device"]

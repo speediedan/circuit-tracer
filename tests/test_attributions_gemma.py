@@ -36,7 +36,7 @@ def verify_token_and_error_edges(
     s = graph.input_tokens
     adjacency_matrix = graph.adjacency_matrix.to(get_default_device())
     active_features = graph.active_features.to(get_default_device())
-    logit_tokens = graph.logit_tokens.to(get_default_device())
+    logit_tokens = graph.logit_token_ids
     total_active_features = active_features.size(0)
     pos_start = 1  # ignore first token (BOS)
 
@@ -131,7 +131,7 @@ def verify_feature_edges(
     s = graph.input_tokens
     adjacency_matrix = graph.adjacency_matrix.to(get_default_device())
     active_features = graph.active_features.to(get_default_device())
-    logit_tokens = graph.logit_tokens.to(get_default_device())
+    logit_tokens = graph.logit_token_ids
     total_active_features = active_features.size(0)
 
     logits, activation_cache = model.get_activations(s, apply_activation_function=False)
@@ -154,9 +154,10 @@ def verify_feature_edges(
         )  # type:ignore
         new_logits = new_logits.squeeze(0)
 
-        new_relevant_activations = new_activation_cache[  # type:ignore
+        assert new_activation_cache is not None
+        new_relevant_activations = new_activation_cache[
             active_features[:, 0], active_features[:, 1], active_features[:, 2]
-        ]  # type:ignore
+        ]
         new_relevant_logits = new_logits[-1, logit_tokens]
         new_demeaned_relevant_logits = new_relevant_logits - new_logits[-1].mean()
 
@@ -396,7 +397,7 @@ def test_gemma_2_2b():
     s = "The National Digital Analytics Group (ND"
     model = ReplacementModel.from_pretrained("google/gemma-2-2b", "gemma")
     assert isinstance(model, TransformerLensReplacementModel)
-    graph = attribute(s, model)
+    graph = attribute(s, model, batch_size=256)
 
     print("Changing logit softcap to 0, as the logits will otherwise be off.")
     with model.zero_softcap():
@@ -409,7 +410,7 @@ def test_gemma_2_2b_clt():
     s = "The National Digital Analytics Group (ND"
     model = ReplacementModel.from_pretrained("google/gemma-2-2b", "mntss/clt-gemma-2-2b-426k")
     assert isinstance(model, TransformerLensReplacementModel)
-    graph = attribute(s, model)
+    graph = attribute(s, model, batch_size=256)
 
     print("Changing logit softcap to 0, as the logits will otherwise be off.")
     with model.zero_softcap():

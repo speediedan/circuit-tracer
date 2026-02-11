@@ -241,6 +241,10 @@ def convert_nnsight_config_to_transformerlens(config):
         config: NNsight config object
         return_unified: If True, return UnifiedConfig instead of HookedTransformerConfig
     """
+    # If already a UnifiedConfig, return as-is
+    if isinstance(config, UnifiedConfig):
+        return config
+
     field_mappings = {
         # Basic model dimensions
         "num_hidden_layers": "n_layers",

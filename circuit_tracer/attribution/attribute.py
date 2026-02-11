@@ -2,6 +2,7 @@
 Unified attribution interface that routes to the correct implementation based on the ReplacementModel backend.
 """
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Literal
 
 import torch
@@ -9,6 +10,7 @@ import torch
 from circuit_tracer.graph import Graph
 
 if TYPE_CHECKING:
+    from circuit_tracer.attribution.targets import TargetSpec
     from circuit_tracer.replacement_model.replacement_model_nnsight import NNSightReplacementModel
     from circuit_tracer.replacement_model.replacement_model_transformerlens import (
         TransformerLensReplacementModel,
@@ -19,6 +21,7 @@ def attribute(
     prompt: str | torch.Tensor | list[int],
     model: "NNSightReplacementModel | TransformerLensReplacementModel",
     *,
+    attribution_targets: "Sequence[str] | Sequence[TargetSpec] | torch.Tensor | None" = None,
     max_n_logits: int = 10,
     desired_logit_prob: float = 0.95,
     batch_size: int = 512,
@@ -35,8 +38,16 @@ def attribute(
     Args:
         prompt: Text, token ids, or tensor - will be tokenized if str.
         model: Frozen ``ReplacementModel`` (either nnsight or transformerlens backend)
-        max_n_logits: Max number of logit nodes.
-        desired_logit_prob: Keep logits until cumulative prob >= this value.
+        attribution_targets: Target specification in one of four formats:
+                          - None: Auto-select salient logits based on probability threshold
+                          - torch.Tensor: Tensor of token indices
+                          - Sequence[str]: Token strings (tokenized, auto-computes probability
+                            and unembed vector)
+                          - Sequence[TargetSpec]: Fully specified custom targets (CustomTarget or
+                            tuple[str, float, torch.Tensor]) with arbitrary unembed directions
+        max_n_logits: Max number of logit nodes (used when attribution_targets is None).
+        desired_logit_prob: Keep logits until cumulative prob >= this value
+                           (used when attribution_targets is None).
         batch_size: How many source nodes to process per backward pass.
         max_feature_nodes: Max number of feature nodes to include in the graph.
         offload: Method for offloading model parameters to save memory.
@@ -55,6 +66,7 @@ def attribute(
         return attribute_nnsight(
             prompt=prompt,
             model=model,  # type: ignore[arg-type]
+            attribution_targets=attribution_targets,
             max_n_logits=max_n_logits,
             desired_logit_prob=desired_logit_prob,
             batch_size=batch_size,
@@ -69,6 +81,7 @@ def attribute(
         return attribute_transformerlens(
             prompt=prompt,
             model=model,  # type: ignore[arg-type]
+            attribution_targets=attribution_targets,
             max_n_logits=max_n_logits,
             desired_logit_prob=desired_logit_prob,
             batch_size=batch_size,
