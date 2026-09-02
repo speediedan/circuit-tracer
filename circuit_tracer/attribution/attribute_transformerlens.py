@@ -166,7 +166,7 @@ def _run_attribution(
     targets = AttributionTargets(
         attribution_targets=attribution_targets,
         logits=ctx.logits[0, -1],
-        unembed_proj=model.unembed.W_U,
+        unembed_proj=model.unembed_weight,
         tokenizer=model.tokenizer,
         max_n_logits=max_n_logits,
         desired_logit_prob=desired_logit_prob,

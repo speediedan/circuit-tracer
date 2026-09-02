@@ -1,23 +1,13 @@
-"""
-Build an **attribution graph** that captures the *direct*, *linear* effects
-between features and next-token logits for a *prompt-specific*
-**local replacement model**.
+"""Attribution for the interp_engine backend.
 
-High-level algorithm (matches the 2025 ``Attribution Graphs`` paper):
-https://transformer-circuits.pub/2025/attribution-graphs/methods.html
+The algorithm is the one described in ``attribute_transformerlens`` and in the 2025
+``Attribution Graphs`` paper; only the parts that touch the model differ, because here the model
+is an unmodified HF module tree rather than a ``HookedTransformer``:
 
-1. **Local replacement model** - we configure gradients to flow only through
-   linear components of the network, effectively bypassing attention mechanisms,
-   MLP non-linearities, and layer normalization scales.
-2. **Forward pass** - record residual-stream activations and mark every active
-   feature.
-3. **Backward passes** - for each source node (feature or logit), inject a
-   *custom* gradient that selects its encoder/decoder direction.  Because the
-   model is linear in the residual stream under our freezes, this contraction
-   equals the *direct effect* A_{s->t}.
-4. **Assemble graph** - store edge weights in a dense matrix and package a
-   ``Graph`` object.  Downstream utilities can *prune* the graph to the subset
-   needed for interpretation.
+* the forward pass stops before the unembedding by running the trunk directly, instead of via a
+  ``stop_at_layer`` argument;
+* the unembedding matrix and the modules to offload are reached through interp-engine's resolved
+  architecture rather than through ``model.unembed`` / ``model.blocks``.
 """
 
 import logging
@@ -34,13 +24,15 @@ from circuit_tracer.attribution.targets import (
     log_attribution_target_info,
 )
 from circuit_tracer.graph import Graph, compute_partial_influences
-from circuit_tracer.replacement_model.replacement_model_nnsight import NNSightReplacementModel
+from circuit_tracer.replacement_model.replacement_model_interp_engine import (
+    InterpEngineReplacementModel,
+)
 from circuit_tracer.utils.disk_offload import offload_modules
 
 
 def attribute(
     prompt: str | torch.Tensor | list[int],
-    model: NNSightReplacementModel,
+    model: InterpEngineReplacementModel,
     *,
     attribution_targets: Sequence[str] | Sequence[TargetSpec] | torch.Tensor | None = None,
     max_n_logits: int = 10,
@@ -51,26 +43,25 @@ def attribute(
     verbose: bool = False,
     update_interval: int = 4,
 ) -> Graph:
-    """Compute an attribution graph for *prompt* using NNSight backend.
+    """Compute an attribution graph for *prompt* using the interp_engine backend.
 
     Args:
         prompt: Text, token ids, or tensor - will be tokenized if str.
-        model: Frozen ``NNSightReplacementModel``
+        model: Frozen ``InterpEngineReplacementModel``
         attribution_targets: Target specification in one of four formats:
                           - None: Auto-select salient logits based on probability threshold
                           - torch.Tensor: Tensor of token indices
                           - Sequence[str]: Token strings (tokenized, auto-computes probability
                             and unembed vector)
-                          - Sequence[TargetSpec]: Fully specified custom targets (CustomTarget or tuple)
-                            with arbitrary unembed directions
+                          - Sequence[TargetSpec]: Fully specified custom targets (CustomTarget or
+                            tuple) with arbitrary unembed directions
         max_n_logits: Max number of logit nodes (used when attribution_targets is None).
         desired_logit_prob: Keep logits until cumulative prob >= this value
                            (used when attribution_targets is None).
         batch_size: How many source nodes to process per backward pass.
         max_feature_nodes: Max number of feature nodes to include in the graph.
         offload: Method for offloading model parameters to save memory.
-                 Options are "cpu" (move to CPU), "disk" (save to disk),
-                 or None (no offloading).
+                 Options are "cpu" (move to CPU), "disk" (save to disk), or None.
         verbose: Whether to show progress information.
         update_interval: Number of batches to process before updating the feature ranking.
 
@@ -115,7 +106,7 @@ def attribute(
 
 
 def _run_attribution(
-    model: NNSightReplacementModel,
+    model: InterpEngineReplacementModel,
     prompt,
     attribution_targets,
     max_n_logits: int,
@@ -140,34 +131,26 @@ def _run_attribution(
     logger.info(f"Precomputation completed in {time.time() - phase_start:.2f}s")
     logger.info(f"Found {ctx.activation_matrix._nnz()} active features")
 
+    # A skip-connection transcoder is still needed during the forward pass, to compute the skip
+    # term the replacement model routes gradient through, so it can only be offloaded afterwards.
     if offload and not model.skip_transcoder:
         offload_handles += offload_modules(model.transcoders, offload)
 
     # Phase 1: forward pass
     logger.info("Phase 1: Running forward pass")
     phase_start = time.time()
-    with model.trace() as tracer:
-        with tracer.invoke(input_ids.expand(batch_size, -1)):
-            pass
-
-        detach_barrier = tracer.barrier(2)
-
-        model.configure_gradient_flow(tracer)
-        model.configure_skip_connection(tracer, barrier=detach_barrier)
-        ctx.cache_residual(model, tracer, barrier=detach_barrier)
-
+    with ctx.install_hooks(model):
+        ctx._resid_activations[-1] = model.forward_trunk(input_ids.expand(batch_size, -1))
     logger.info(f"Forward pass completed in {time.time() - phase_start:.2f}s")
 
     if offload:
-        offload_handles += offload_modules(
-            [layer.mlp for layer in getattr(model.pre_logit_location, "layers")], offload
-        )
+        offload_handles += offload_modules(model.mlp_modules, offload)
         if model.skip_transcoder:
             offload_handles += offload_modules(model.transcoders, offload)
 
     # Phase 2: build input vector list
     logger.info("Phase 2: Building input vectors")
-    phase2_start = time.time()
+    phase_start = time.time()
     feat_layers, feat_pos, _ = activation_matrix.indices()
     n_layers, n_pos, _ = activation_matrix.shape
     total_active_feats = activation_matrix._nnz()
@@ -184,31 +167,29 @@ def _run_attribution(
     log_attribution_target_info(targets, attribution_targets, logger)
 
     if offload:
-        offload_handles += offload_modules([model.embed_location], offload)
-        tied_embeds = (
-            model.embed_weight.untyped_storage().data_ptr()
-            == model.unembed_weight.untyped_storage().data_ptr()
-        )
-        if not tied_embeds:
-            offload_handles += offload_modules([model.lm_head], offload)
+        offload_handles += offload_modules([model.arch.embed], offload)
+        # Weight tying makes the unembedding the same storage as the embedding, so offloading it
+        # a second time would move a tensor that is already gone. interp-engine resolves the
+        # tying as a structural fact rather than us comparing data pointers.
+        if not model.arch.quirks.tied_embeddings:
+            offload_handles += offload_modules([model.arch.lm_head], offload)
 
     logit_offset = len(feat_layers) + (n_layers + 1) * n_pos
     n_logits = len(targets)
     total_nodes = logit_offset + n_logits
 
-    actual_max_feature_nodes = min(max_feature_nodes or total_active_feats, total_active_feats)
-    logger.info(f"Will include {actual_max_feature_nodes} of {total_active_feats} feature nodes")
+    max_feature_nodes = min(max_feature_nodes or total_active_feats, total_active_feats)
+    logger.info(f"Will include {max_feature_nodes} of {total_active_feats} feature nodes")
 
-    edge_matrix = torch.zeros(actual_max_feature_nodes + n_logits, total_nodes)
+    edge_matrix = torch.zeros(max_feature_nodes + n_logits, total_nodes)
     # Maps row indices in edge_matrix to original feature/node indices
     # First populated with logit node IDs, then feature IDs in attribution order
-    row_to_node_index = torch.zeros(actual_max_feature_nodes + n_logits, dtype=torch.int32)
-    logger.info(f"Input vectors built in {time.time() - phase2_start:.2f}s")
+    row_to_node_index = torch.zeros(max_feature_nodes + n_logits, dtype=torch.int32)
+    logger.info(f"Input vectors built in {time.time() - phase_start:.2f}s")
 
     # Phase 3: logit attribution
     logger.info("Phase 3: Computing logit attributions")
-    phase3_start = time.time()
-    i = -1
+    phase_start = time.time()
     for i in range(0, len(targets), batch_size):
         batch = targets.logit_vectors[i : i + batch_size]
         rows = ctx.compute_batch(
@@ -220,31 +201,26 @@ def _run_attribution(
         row_to_node_index[i : i + batch.shape[0]] = (
             torch.arange(i, i + batch.shape[0]) + logit_offset
         )
-
-    logger.info(f"{i + 1} logit attribution(s) completed in {time.time() - phase3_start:.2f}s")
+    logger.info(f"Logit attributions completed in {time.time() - phase_start:.2f}s")
 
     # Phase 4: feature attribution
     logger.info("Phase 4: Computing feature attributions")
-    phase4_start = time.time()
+    phase_start = time.time()
     st = n_logits
     visited = torch.zeros(total_active_feats, dtype=torch.bool)
     n_visited = 0
 
-    pbar = tqdm(
-        total=actual_max_feature_nodes,
-        desc="Feature influence computation",
-        disable=not verbose,
-    )
+    pbar = tqdm(total=max_feature_nodes, desc="Feature influence computation", disable=not verbose)
 
-    while n_visited < actual_max_feature_nodes:
-        if actual_max_feature_nodes == total_active_feats:
+    while n_visited < max_feature_nodes:
+        if max_feature_nodes == total_active_feats:
             pending = torch.arange(total_active_feats)
         else:
             influences = compute_partial_influences(
                 edge_matrix[:st], targets.logit_probabilities, row_to_node_index[:st]
             )
             feature_rank = torch.argsort(influences[:total_active_feats], descending=True).cpu()
-            queue_size = min(update_interval * batch_size, actual_max_feature_nodes - n_visited)
+            queue_size = min(update_interval * batch_size, max_feature_nodes - n_visited)
             pending = feature_rank[~visited[feature_rank]][:queue_size]
 
         queue = [pending[i : i + batch_size] for i in range(0, len(pending), batch_size)]
@@ -256,7 +232,7 @@ def _run_attribution(
                 layers=feat_layers[idx_batch],
                 positions=feat_pos[idx_batch],
                 inject_values=ctx.encoder_vecs[idx_batch],
-                retain_graph=n_visited < actual_max_feature_nodes,
+                retain_graph=n_visited < max_feature_nodes,
             )
 
             end = min(st + batch_size, st + rows.shape[0])
@@ -267,11 +243,12 @@ def _run_attribution(
             pbar.update(len(idx_batch))
 
     pbar.close()
-    logger.info(f"Feature attributions completed in {time.time() - phase4_start:.2f}s")
+    ctx.remove_hooks()
+    logger.info(f"Feature attributions completed in {time.time() - phase_start:.2f}s")
 
     # Phase 5: packaging graph
     selected_features = torch.where(visited)[0]
-    if actual_max_feature_nodes < total_active_feats:
+    if max_feature_nodes < total_active_feats:
         non_feature_nodes = torch.arange(total_active_feats, total_nodes)
         col_read = torch.cat([selected_features, non_feature_nodes])
         edge_matrix = edge_matrix[:, col_read]
@@ -280,11 +257,11 @@ def _run_attribution(
     edge_matrix = edge_matrix[row_to_node_index.argsort()]
     final_node_count = edge_matrix.shape[1]
     full_edge_matrix = torch.zeros(final_node_count, final_node_count)
-    full_edge_matrix[:actual_max_feature_nodes] = edge_matrix[:actual_max_feature_nodes]
-    full_edge_matrix[-n_logits:] = edge_matrix[actual_max_feature_nodes:]
+    full_edge_matrix[:max_feature_nodes] = edge_matrix[:max_feature_nodes]
+    full_edge_matrix[-n_logits:] = edge_matrix[max_feature_nodes:]
 
     graph = Graph(
-        input_string=str(model.tokenizer.decode(input_ids)),
+        input_string=model.tokenizer.decode(input_ids),
         input_tokens=input_ids,
         logit_targets=targets.logit_targets,
         logit_probabilities=targets.logit_probabilities,
@@ -292,8 +269,8 @@ def _run_attribution(
         active_features=activation_matrix.indices().T,
         activation_values=activation_matrix.values(),
         selected_features=selected_features,
-        adjacency_matrix=full_edge_matrix.detach(),
-        cfg=model.config,
+        adjacency_matrix=full_edge_matrix,
+        cfg=model.cfg,
         scan_name=model.scan_name,
     )
 
