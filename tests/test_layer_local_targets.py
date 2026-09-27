@@ -16,9 +16,9 @@ from tests.test_attributions_gemma_nnsight import gemma_2_config, load_dummy_gem
 PROMPT = torch.tensor([0, 3, 4, 3, 2, 5, 3, 8])
 
 
-def _small_model():
+def _small_model(n_layers: int = 3):
     cfg = copy.deepcopy(gemma_2_config)
-    cfg.num_hidden_layers = 2
+    cfg.num_hidden_layers = n_layers
     cfg.hidden_size = 8
     cfg.intermediate_size = 16
     cfg.head_dim = 4
@@ -68,30 +68,37 @@ def _block_output_under_intervention(model, layer, interventions):
     return store["h"].squeeze(0)
 
 
+def _can_reach(src_layer: int, src_pos: int, layer: int, pos: int) -> bool:
+    """Whether a feature at (src_layer, src_pos) can write into block ``layer``'s output at ``pos``.
+
+    A feature at layer L writes after that block's attention, so at L == layer only the same position reaches the
+    read; at L < layer, block L+1..layer's attention carries any earlier position forward.
+    """
+    return src_layer < layer and src_pos <= pos or src_layer == layer and src_pos == pos
+
+
 def test_layer_local_target_edges_match_frozen_interventions(model):
-    layer, pos = 0, 5
+    layer, pos = 1, 5  # a middle block of three, so cross-position paths through attention are exercised
     torch.manual_seed(0)
     v = torch.randn(model.cfg.d_model)
-    graph = attribute(PROMPT, model, attribution_targets=[CustomTarget("jl@0", 1.0, v, layer=layer, position=pos)])
+    graph = attribute(PROMPT, model, attribution_targets=[CustomTarget("jl@1", 1.0, v, layer=layer, position=pos)])
     row = graph.adjacency_matrix[-1]  # the single target is the last node
-    feats = graph.active_features
+    feats = graph.active_features.tolist()
     _, acts = model.get_activations(PROMPT, apply_activation_function=False)
     base = _block_output_under_intervention(model, layer, [])[pos] @ v
 
-    upstream = [i for i, (l, p, _) in enumerate(feats.tolist()) if l <= layer and p <= pos]
-    downstream = [i for i, (l, p, _) in enumerate(feats.tolist()) if l > layer or p > pos]
-    assert upstream and downstream, "the toy prompt must exercise both cases"
-    # nothing downstream of the read site can reach it
-    assert torch.all(row[downstream] == 0)
-    checked = 0
-    for i in upstream[:40]:
-        l, p, f = feats[i].tolist()
-        old = acts[l, p, f]
-        h = _block_output_under_intervention(model, layer, [(l, p, f, old * 2)])
+    reach = [i for i, (l, p, _) in enumerate(feats) if _can_reach(l, p, layer, pos)]
+    unreachable = [i for i, (l, p, _) in enumerate(feats) if not _can_reach(l, p, layer, pos)]
+    # nothing that cannot write into the read site may carry an edge to it
+    assert unreachable and torch.all(row[unreachable] == 0)
+    # the check must be able to fail: enough sources with clearly nonzero edges, spanning both layers that reach
+    nonzero = [i for i in reach if abs(float(row[i])) > 1e-3]
+    assert len(nonzero) >= 5 and {feats[i][0] for i in nonzero} == {layer - 1, layer}
+    for i in reach:  # every source that can reach, not a sample: a zero-heavy prefix proves nothing
+        l, p, f = feats[i]
+        h = _block_output_under_intervention(model, layer, [(l, p, f, acts[l, p, f] * 2)])
         measured = float(h[pos] @ v - base)
         assert measured == pytest.approx(float(row[i]), abs=5e-4, rel=1e-3), (l, p, f)
-        checked += 1
-    assert checked > 0
 
 
 def test_last_block_target_matches_final_residual_target(model):
@@ -121,7 +128,7 @@ def test_default_custom_target_unchanged(model):
     assert torch.equal(plain.adjacency_matrix, named.adjacency_matrix)
 
 
-@pytest.mark.parametrize("kwargs, message", [({"layer": 2}, "not a block"), ({"layer": 0, "position": 99}, "outside the prompt")])
+@pytest.mark.parametrize("kwargs, message", [({"layer": 3}, "not a block"), ({"layer": 0, "position": 99}, "outside the prompt")])
 def test_out_of_range_sites_are_refused(model, kwargs, message):
     with pytest.raises(ValueError, match=message):
         attribute(PROMPT, model, attribution_targets=[CustomTarget("bad", 1.0, torch.ones(model.cfg.d_model), **kwargs)])
