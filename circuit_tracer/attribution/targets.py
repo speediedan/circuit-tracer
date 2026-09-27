@@ -126,9 +126,13 @@ class AttributionTargets:
         self.logit_targets, self.logit_probabilities, self.logit_vectors = attr_spec
         # where each target is read: (block layer, position), or (None, None) for the final residual at the last
         # position. Only fully specified custom targets can name a site.
-        self.target_sites: list[tuple[int | None, int | None]] = [(None, None)] * len(self.logit_targets)
-        if isinstance(attribution_targets, Sequence) and attribution_targets and not isinstance(
-            attribution_targets[0], str
+        self.target_sites: list[tuple[int | None, int | None]] = [(None, None)] * len(
+            self.logit_targets
+        )
+        if (
+            isinstance(attribution_targets, Sequence)
+            and attribution_targets
+            and not isinstance(attribution_targets[0], str)
         ):
             self.target_sites = [
                 (t.layer, t.position)
@@ -366,9 +370,15 @@ class AttributionTargets:
         if not isinstance(vec, torch.Tensor):
             raise TypeError(f"Custom target vec must be torch.Tensor, got {type(vec)}")
         for name, value in (("layer", layer), ("position", position)):
-            if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value < 0):
-                raise TypeError(f"Custom target {name} must be a non-negative int or None, got {value!r}")
-        return CustomTarget(token_str=token_str, prob=float(prob), vec=vec, layer=layer, position=position)
+            if value is not None and (
+                not isinstance(value, int) or isinstance(value, bool) or value < 0
+            ):
+                raise TypeError(
+                    f"Custom target {name} must be a non-negative int or None, got {value!r}"
+                )
+        return CustomTarget(
+            token_str=token_str, prob=float(prob), vec=vec, layer=layer, position=position
+        )
 
     @staticmethod
     def _from_tuple(

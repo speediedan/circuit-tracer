@@ -57,7 +57,9 @@ class AttributionContext:
         # Forward-pass cache
         self._resid_activations: list[torch.Tensor] = []
         self._feature_output_activations: list[torch.Tensor] = []
-        self._block_output_activations: list[torch.Tensor] = []  # residual after each block (layer-local targets)
+        self._block_output_activations: list[
+            torch.Tensor
+        ] = []  # residual after each block (layer-local targets)
         self._batch_buffer: torch.Tensor | None = None
         self.n_layers: int = n_layers
 
@@ -74,7 +76,9 @@ class AttributionContext:
         total_active_feats = activation_matrix._nnz()
         self._row_size: int = total_active_feats + (n_layers + 1) * n_pos  # + logits later
 
-    def cache_residual(self, model: "NNSightReplacementModel", tracer, barrier=None, cache_block_outputs=False):
+    def cache_residual(
+        self, model: "NNSightReplacementModel", tracer, barrier=None, cache_block_outputs=False
+    ):
         """Cache the model's residual for use in the attribution context."""
         with tracer.invoke():
             for feature_input_loc in model.feature_input_locs:
@@ -202,7 +206,9 @@ class AttributionContext:
         if block_output is None:
             block_output = torch.zeros_like(layers, dtype=torch.bool)
         if block_output.any() and not self._block_output_activations:
-            raise RuntimeError("block-output rows need cache_residual(..., cache_block_outputs=True)")
+            raise RuntimeError(
+                "block-output rows need cache_residual(..., cache_block_outputs=True)"
+            )
         # a block-output row at layer l is reached in the backward pass after layer l+1's feature input, so the pass
         # starts there (index n_layers is the final residual, downstream of the last block's output)
         start_layers = torch.where(block_output, layers + 1, layers)

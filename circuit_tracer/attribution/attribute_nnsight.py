@@ -155,7 +155,10 @@ def _run_attribution(
         model.configure_gradient_flow(tracer)
         model.configure_skip_connection(tracer, barrier=detach_barrier)
         ctx.cache_residual(
-            model, tracer, barrier=detach_barrier, cache_block_outputs=_wants_layer_local(attribution_targets)
+            model,
+            tracer,
+            barrier=detach_barrier,
+            cache_block_outputs=_wants_layer_local(attribution_targets),
         )
 
     logger.info(f"Forward pass completed in {time.time() - phase_start:.2f}s")
@@ -211,7 +214,9 @@ def _run_attribution(
     logger.info("Phase 3: Computing logit attributions")
     phase3_start = time.time()
     i = -1
-    target_layers, target_positions, target_block_output = _target_injection_sites(targets, n_layers, n_pos)
+    target_layers, target_positions, target_block_output = _target_injection_sites(
+        targets, n_layers, n_pos
+    )
     for i in range(0, len(targets), batch_size):
         batch = targets.logit_vectors[i : i + batch_size]
         rows = ctx.compute_batch(
@@ -326,11 +331,18 @@ def _target_injection_sites(targets, n_layers: int, n_pos: int):
     layers, positions, block_output = [], [], []
     for (layer, position), target in zip(targets.target_sites, targets.logit_targets):
         if position is not None and not 0 <= position < n_pos:
-            raise ValueError(f"target {target.token_str!r}: position {position} is outside the prompt (0..{n_pos - 1})")
+            raise ValueError(
+                f"target {target.token_str!r}: position {position} is outside the prompt (0..{n_pos - 1})"
+            )
         if layer is not None and not 0 <= layer < n_layers:
-            raise ValueError(f"target {target.token_str!r}: layer {layer} is not a block of this model (0..{n_layers - 1})")
+            raise ValueError(
+                f"target {target.token_str!r}: layer {layer} is not a block of this model (0..{n_layers - 1})"
+            )
         layers.append(n_layers if layer is None else layer)
         positions.append(n_pos - 1 if position is None else position)
         block_output.append(layer is not None)
-    return torch.tensor(layers), torch.tensor(positions), torch.tensor(block_output, dtype=torch.bool)
-
+    return (
+        torch.tensor(layers),
+        torch.tensor(positions),
+        torch.tensor(block_output, dtype=torch.bool),
+    )

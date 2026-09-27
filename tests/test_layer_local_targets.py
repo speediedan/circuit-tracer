@@ -59,7 +59,10 @@ def _block_output_under_intervention(model, layer, interventions):
     try:
         if interventions:
             model.feature_intervention(
-                PROMPT, interventions, constrained_layers=range(model.cfg.n_layers), apply_activation_function=False
+                PROMPT,
+                interventions,
+                constrained_layers=range(model.cfg.n_layers),
+                apply_activation_function=False,
             )
         else:
             model.get_activations(PROMPT, apply_activation_function=False)
@@ -78,27 +81,36 @@ def _can_reach(src_layer: int, src_pos: int, layer: int, pos: int) -> bool:
 
 
 def test_layer_local_target_edges_match_frozen_interventions(model):
-    layer, pos = 1, 5  # a middle block of three, so cross-position paths through attention are exercised
+    layer, pos = (
+        1,
+        5,
+    )  # a middle block of three, so cross-position paths through attention are exercised
     torch.manual_seed(0)
     v = torch.randn(model.cfg.d_model)
-    graph = attribute(PROMPT, model, attribution_targets=[CustomTarget("jl@1", 1.0, v, layer=layer, position=pos)])
+    graph = attribute(
+        PROMPT, model, attribution_targets=[CustomTarget("jl@1", 1.0, v, layer=layer, position=pos)]
+    )
     row = graph.adjacency_matrix[-1]  # the single target is the last node
     feats = graph.active_features.tolist()
     _, acts = model.get_activations(PROMPT, apply_activation_function=False)
     base = _block_output_under_intervention(model, layer, [])[pos] @ v
 
-    reach = [i for i, (l, p, _) in enumerate(feats) if _can_reach(l, p, layer, pos)]
-    unreachable = [i for i, (l, p, _) in enumerate(feats) if not _can_reach(l, p, layer, pos)]
+    reach = [i for i, (src_layer, p, _) in enumerate(feats) if _can_reach(src_layer, p, layer, pos)]
+    unreachable = [
+        i for i, (src_layer, p, _) in enumerate(feats) if not _can_reach(src_layer, p, layer, pos)
+    ]
     # nothing that cannot write into the read site may carry an edge to it
     assert unreachable and torch.all(row[unreachable] == 0)
     # the check must be able to fail: enough sources with clearly nonzero edges, spanning both layers that reach
     nonzero = [i for i in reach if abs(float(row[i])) > 1e-3]
     assert len(nonzero) >= 5 and {feats[i][0] for i in nonzero} == {layer - 1, layer}
     for i in reach:  # every source that can reach, not a sample: a zero-heavy prefix proves nothing
-        l, p, f = feats[i]
-        h = _block_output_under_intervention(model, layer, [(l, p, f, acts[l, p, f] * 2)])
+        src_layer, p, f = feats[i]
+        h = _block_output_under_intervention(
+            model, layer, [(src_layer, p, f, acts[src_layer, p, f] * 2)]
+        )
         measured = float(h[pos] @ v - base)
-        assert measured == pytest.approx(float(row[i]), abs=5e-4, rel=1e-3), (l, p, f)
+        assert measured == pytest.approx(float(row[i]), abs=5e-4, rel=1e-3), (src_layer, p, f)
 
 
 def test_last_block_target_matches_final_residual_target(model):
@@ -114,9 +126,15 @@ def test_last_block_target_matches_final_residual_target(model):
     # gemma RMSNorm: y = x * rsqrt(mean(x^2) + eps) * (1 + w); the denominator is frozen during attribution
     scale = torch.rsqrt(h.pow(2).mean() + norm_mod.eps)
     v = u * (1 + norm_mod.weight.detach()) * scale
-    local = attribute(PROMPT, model, attribution_targets=[CustomTarget("local", 1.0, v, layer=n - 1, position=pos)])
+    local = attribute(
+        PROMPT,
+        model,
+        attribution_targets=[CustomTarget("local", 1.0, v, layer=n - 1, position=pos)],
+    )
     assert torch.equal(final.active_features, local.active_features)
-    assert torch.allclose(final.adjacency_matrix[-1], local.adjacency_matrix[-1], atol=1e-5, rtol=1e-4)
+    assert torch.allclose(
+        final.adjacency_matrix[-1], local.adjacency_matrix[-1], atol=1e-5, rtol=1e-4
+    )
 
 
 def test_default_custom_target_unchanged(model):
@@ -128,10 +146,17 @@ def test_default_custom_target_unchanged(model):
     assert torch.equal(plain.adjacency_matrix, named.adjacency_matrix)
 
 
-@pytest.mark.parametrize("kwargs, message", [({"layer": 3}, "not a block"), ({"layer": 0, "position": 99}, "outside the prompt")])
+@pytest.mark.parametrize(
+    "kwargs, message",
+    [({"layer": 3}, "not a block"), ({"layer": 0, "position": 99}, "outside the prompt")],
+)
 def test_out_of_range_sites_are_refused(model, kwargs, message):
     with pytest.raises(ValueError, match=message):
-        attribute(PROMPT, model, attribution_targets=[CustomTarget("bad", 1.0, torch.ones(model.cfg.d_model), **kwargs)])
+        attribute(
+            PROMPT,
+            model,
+            attribution_targets=[CustomTarget("bad", 1.0, torch.ones(model.cfg.d_model), **kwargs)],
+        )
 
 
 def test_site_fields_are_validated():
