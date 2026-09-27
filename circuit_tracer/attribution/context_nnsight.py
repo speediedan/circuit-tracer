@@ -57,6 +57,7 @@ class AttributionContext:
         # Forward-pass cache
         self._resid_activations: list[torch.Tensor] = []
         self._feature_output_activations: list[torch.Tensor] = []
+        self._block_output_activations: list[torch.Tensor] = []  # residual after each block (layer-local targets)
         self._batch_buffer: torch.Tensor | None = None
         self.n_layers: int = n_layers
 
@@ -73,7 +74,7 @@ class AttributionContext:
         total_active_feats = activation_matrix._nnz()
         self._row_size: int = total_active_feats + (n_layers + 1) * n_pos  # + logits later
 
-    def cache_residual(self, model: "NNSightReplacementModel", tracer, barrier=None):
+    def cache_residual(self, model: "NNSightReplacementModel", tracer, barrier=None, cache_block_outputs=False):
         """Cache the model's residual for use in the attribution context."""
         with tracer.invoke():
             for feature_input_loc in model.feature_input_locs:
@@ -88,6 +89,14 @@ class AttributionContext:
                     barrier()
 
                 self._feature_output_activations.append(feature_output_loc_.output)  # type: ignore
+
+        if cache_block_outputs:
+            # a separate invoke, read in forward order: each block's output is produced after its MLP output has been
+            # replaced by the skip/detach invoke above, so no barrier is needed to see the tensor the next block uses
+            with tracer.invoke():
+                for layer_loc in model.layer_output_locs:
+                    out = layer_loc.output  # type: ignore
+                    self._block_output_activations.append(out[0] if isinstance(out, tuple) else out)
 
     def compute_score(
         self,
@@ -154,6 +163,7 @@ class AttributionContext:
         positions: torch.Tensor,
         inject_values: torch.Tensor,
         retain_graph: bool = True,
+        block_output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Return attribution rows for a batch of (layer, pos) nodes.
 
@@ -165,6 +175,9 @@ class AttributionContext:
             positions: 1-D tensor of token positions *c* for the source nodes.
             inject_values: `(batch, d_model)` tensor with outer product
                 a_s * W^(enc/dec) to inject as custom gradient.
+            block_output: optional bool mask; where True, the row is injected at the OUTPUT of block
+                ``layers[i]`` (the residual after that block's MLP) instead of at the block's feature input.
+                Requires ``cache_residual(..., cache_block_outputs=True)``.
 
         Returns:
             torch.Tensor: ``(batch, row_size)`` matrix - one row per node.
@@ -186,20 +199,35 @@ class AttributionContext:
             grads_out.index_put_((batch_indices, pos_indices), values.to(grads_out.dtype))
             grad_point.grad = grads_out
 
-        layers_in_batch = sorted(layers.unique().tolist(), reverse=True)
-
-        last_layer = max(layers_in_batch)
+        if block_output is None:
+            block_output = torch.zeros_like(layers, dtype=torch.bool)
+        if block_output.any() and not self._block_output_activations:
+            raise RuntimeError("block-output rows need cache_residual(..., cache_block_outputs=True)")
+        # a block-output row at layer l is reached in the backward pass after layer l+1's feature input, so the pass
+        # starts there (index n_layers is the final residual, downstream of the last block's output)
+        start_layers = torch.where(block_output, layers + 1, layers)
+        last_layer = int(start_layers.max().item())
         with self._resid_activations[last_layer].backward(
             gradient=torch.zeros_like(self._resid_activations[last_layer]),
             retain_graph=retain_graph,
         ):
             for layer in reversed(range(last_layer + 1)):
+                out_mask = block_output & (layers == layer)
+                if out_mask.any():
+                    # the block's output lies between layer+1's feature input and this layer's MLP output: inject
+                    # before that MLP output's gradient is read below
+                    _inject(
+                        grad_point=self._block_output_activations[layer],
+                        batch_indices=batch_idx[out_mask],
+                        pos_indices=positions[out_mask],
+                        values=inject_values[out_mask],
+                    )
                 if layer != last_layer:
                     grad = self._feature_output_activations[layer + 1].grad.clone()  # type:ignore
                     self.compute_feature_attributions(layer, grad)
                     self.compute_error_attributions(layer, grad)
 
-                mask = layers == layer
+                mask = (layers == layer) & ~block_output
                 if mask.any():
                     _inject(
                         grad_point=self._resid_activations[layer],

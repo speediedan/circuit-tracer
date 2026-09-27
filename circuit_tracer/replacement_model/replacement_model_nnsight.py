@@ -980,6 +980,13 @@ class NNSightReplacementModel(LanguageModel):
             yield self.get_feature_output_loc(layer)  # type: ignore
 
     @property
+    def layer_output_locs(self) -> Iterator[nn.Module]:
+        """Every decoder block, whose output is the residual stream after that block (read by layer-local targets)."""
+        layers = getattr(self.pre_logit_location, "layers")
+        for layer in range(self.cfg.n_layers):  # type: ignore
+            yield layers[layer]
+
+    @property
     def attention_locs(self) -> Iterator[nn.Module]:
         """Dynamically resolve the attention pattern hook locations for every layer."""
         for layer in range(self.cfg.n_layers):  # type: ignore

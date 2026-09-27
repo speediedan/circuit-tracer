@@ -154,7 +154,9 @@ def _run_attribution(
 
         model.configure_gradient_flow(tracer)
         model.configure_skip_connection(tracer, barrier=detach_barrier)
-        ctx.cache_residual(model, tracer, barrier=detach_barrier)
+        ctx.cache_residual(
+            model, tracer, barrier=detach_barrier, cache_block_outputs=_wants_layer_local(attribution_targets)
+        )
 
     logger.info(f"Forward pass completed in {time.time() - phase_start:.2f}s")
 
@@ -209,12 +211,14 @@ def _run_attribution(
     logger.info("Phase 3: Computing logit attributions")
     phase3_start = time.time()
     i = -1
+    target_layers, target_positions, target_block_output = _target_injection_sites(targets, n_layers, n_pos)
     for i in range(0, len(targets), batch_size):
         batch = targets.logit_vectors[i : i + batch_size]
         rows = ctx.compute_batch(
-            layers=torch.full((batch.shape[0],), n_layers),
-            positions=torch.full((batch.shape[0],), n_pos - 1),
+            layers=target_layers[i : i + batch.shape[0]],
+            positions=target_positions[i : i + batch.shape[0]],
             inject_values=batch,
+            block_output=target_block_output[i : i + batch.shape[0]],
         )
         edge_matrix[i : i + batch.shape[0], :logit_offset] = rows.cpu()
         row_to_node_index[i : i + batch.shape[0]] = (
@@ -301,3 +305,32 @@ def _run_attribution(
     logger.info(f"Attribution completed in {total_time:.2f}s")
 
     return graph
+
+
+def _wants_layer_local(attribution_targets) -> bool:
+    """Whether any raw target spec names an intermediate block (decided before targets are processed)."""
+    from circuit_tracer.attribution.targets import CustomTarget
+
+    if not isinstance(attribution_targets, (list, tuple)):
+        return False
+    return any(isinstance(t, CustomTarget) and t.layer is not None for t in attribution_targets)
+
+
+def _target_injection_sites(targets, n_layers: int, n_pos: int):
+    """Per-target (layer, position, block_output) for the target rows of the attribution.
+
+    A target without a site is read at the final residual (layer ``n_layers``) at the last position, as before. A
+    target with ``layer`` set is read at the output of that block. A site outside the model or the prompt is refused by
+    name rather than clamped.
+    """
+    layers, positions, block_output = [], [], []
+    for (layer, position), target in zip(targets.target_sites, targets.logit_targets):
+        if position is not None and not 0 <= position < n_pos:
+            raise ValueError(f"target {target.token_str!r}: position {position} is outside the prompt (0..{n_pos - 1})")
+        if layer is not None and not 0 <= layer < n_layers:
+            raise ValueError(f"target {target.token_str!r}: layer {layer} is not a block of this model (0..{n_layers - 1})")
+        layers.append(n_layers if layer is None else layer)
+        positions.append(n_pos - 1 if position is None else position)
+        block_output.append(layer is not None)
+    return torch.tensor(layers), torch.tensor(positions), torch.tensor(block_output, dtype=torch.bool)
+

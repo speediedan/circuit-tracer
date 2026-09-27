@@ -163,6 +163,12 @@ def _run_attribution(
         max_n_logits=max_n_logits,
         desired_logit_prob=desired_logit_prob,
     )
+    if any(site != (None, None) for site in targets.target_sites):
+        raise NotImplementedError(
+            "CustomTarget.layer / CustomTarget.position (a target read at an intermediate block output or a "
+            "non-final position) is implemented for the NNsight backend only; the interp-engine backend would "
+            "inject it at the final residual, which attributes a different quantity"
+        )
 
     log_attribution_target_info(targets, attribution_targets, logger)
 

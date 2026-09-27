@@ -32,12 +32,20 @@ class CustomTarget(NamedTuple):
     Attributes:
         token_str: Label for this target (e.g., "logit(x)-logit(y)")
         prob: Weight/probability for this target
-        vec: Custom unembed direction vector (d_model,)
+        vec: Custom direction vector (d_model,). With ``layer`` unset it is read at the final residual
+            (post final norm), like a logit. With ``layer`` set it is read at the output of block
+            ``layer``, i.e. the residual stream after that block's MLP.
+        layer: Block whose output residual the target reads. ``None`` (the default) keeps the final
+            residual, today's behaviour. A direction that lives in an intermediate residual (a
+            Jacobian-lens direction, a probe) is only attributed correctly at the layer it reads.
+        position: Token position the target reads. ``None`` means the last position.
     """
 
     token_str: str
     prob: float
     vec: torch.Tensor
+    layer: int | None = None
+    position: int | None = None
 
 
 TargetSpec = CustomTarget | tuple[str, float, torch.Tensor]
@@ -116,6 +124,21 @@ class AttributionTargets:
                 f"or Sequence[TargetSpec], got {type(attribution_targets)}"
             )
         self.logit_targets, self.logit_probabilities, self.logit_vectors = attr_spec
+        # where each target is read: (block layer, position), or (None, None) for the final residual at the last
+        # position. Only fully specified custom targets can name a site.
+        self.target_sites: list[tuple[int | None, int | None]] = [(None, None)] * len(self.logit_targets)
+        if isinstance(attribution_targets, Sequence) and attribution_targets and not isinstance(
+            attribution_targets[0], str
+        ):
+            self.target_sites = [
+                (t.layer, t.position)
+                for t in (self._validate_custom_target(x) for x in attribution_targets)  # type: ignore[arg-type]
+            ]
+
+    @property
+    def has_layer_local(self) -> bool:
+        """Whether any target reads an intermediate block output rather than the final residual."""
+        return any(layer is not None for layer, _ in self.target_sites)
 
     def __len__(self) -> int:
         """Number of attribution targets."""
@@ -324,22 +347,28 @@ class AttributionTargets:
         Raises:
             ValueError: If the tuple has wrong length or element types
         """
+        layer = position = None
         if not isinstance(target, CustomTarget):
             if len(target) != 3:
                 raise ValueError(
                     f"Tuple targets must have exactly 3 elements "
-                    f"(token_str, probability, vector), got {len(target)}"
+                    f"(token_str, probability, vector), got {len(target)}; a layer-local target "
+                    f"is expressed as a CustomTarget with layer= and position="
                 )
             token_str, prob, vec = target
         else:
             token_str, prob, vec = target.token_str, target.prob, target.vec
+            layer, position = target.layer, target.position
         if not isinstance(token_str, str):
             raise TypeError(f"Custom target token_str must be str, got {type(token_str)}")
         if not isinstance(prob, (int, float)):
             raise TypeError(f"Custom target prob must be int or float, got {type(prob)}")
         if not isinstance(vec, torch.Tensor):
             raise TypeError(f"Custom target vec must be torch.Tensor, got {type(vec)}")
-        return CustomTarget(token_str=token_str, prob=float(prob), vec=vec)
+        for name, value in (("layer", layer), ("position", position)):
+            if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value < 0):
+                raise TypeError(f"Custom target {name} must be a non-negative int or None, got {value!r}")
+        return CustomTarget(token_str=token_str, prob=float(prob), vec=vec, layer=layer, position=position)
 
     @staticmethod
     def _from_tuple(
