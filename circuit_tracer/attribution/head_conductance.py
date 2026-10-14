@@ -168,7 +168,8 @@ def head_conductance(
                 layer.self_attn.v_proj.register_forward_hook(save_v),
             ]
         try:
-            out = model(input_ids=ids.expand(n, -1), output_attentions=True)
+            # the target reads the last position only; full logits would cost points x positions x vocabulary
+            out = model(input_ids=ids.expand(n, -1), output_attentions=True, logits_to_keep=1)
             t = out.logits[:, -1] @ w
             t.sum().backward()
         finally:
