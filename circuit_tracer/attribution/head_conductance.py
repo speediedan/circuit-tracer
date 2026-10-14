@@ -56,6 +56,9 @@ class HeadConductance:
         qk: ``(n_layers, n_heads)``: each head's pattern part.
         ov: ``(n_layers, n_heads)``: each head's value part.
         n_steps: The number of trapezoid intervals.
+        t_path: ``(n_steps + 1,)``: the target at every path point.
+        dt_dalpha: ``(n_steps + 1,)``: the target's derivative along the path at every point, the gradient at the
+            input embeddings dotted with their change. At the start it is the first-order prediction of the change.
     """
 
     t_from: float
@@ -64,6 +67,13 @@ class HeadConductance:
     qk: torch.Tensor
     ov: torch.Tensor
     n_steps: int
+    t_path: torch.Tensor
+    dt_dalpha: torch.Tensor
+
+    @property
+    def first_order(self) -> float:
+        """The change a linearization at the first prompt predicts: the path derivative at its start."""
+        return float(self.dt_dalpha[0])
 
     @property
     def delta(self) -> float:
@@ -140,11 +150,13 @@ def head_conductance(
         """Forward and backward at a batch of path points; per-layer values and gradients for the cut."""
         n = alphas.shape[0]
         store: dict[str, list] = {k: [None] * n_layers for k in ("r_in", "r_mid", "z", "v")}
-        hooks = [
-            embed.register_forward_hook(
-                lambda mod, inp, out: (e0 + alphas.view(-1, 1, 1) * (e1 - e0)).requires_grad_(True)
-            )
-        ]
+        path_point: dict[str, torch.Tensor] = {}
+
+        def interpolate(mod, inp, out):
+            path_point["e"] = (e0 + alphas.view(-1, 1, 1) * (e1 - e0)).requires_grad_(True)
+            return path_point["e"]
+
+        hooks = [embed.register_forward_hook(interpolate)]
         for i, layer in enumerate(layers):
 
             def save_in(mod, args, kwargs, i=i):
@@ -194,7 +206,8 @@ def head_conductance(
             gz = z.grad.view(n, -1, n_heads, head_dim).transpose(1, 2)
             per_layer.append((store["r_in"][i], store["r_mid"][i].grad, a, v, gz))
         model.zero_grad(set_to_none=True)
-        return t.detach(), per_layer
+        dt_dalpha = (path_point["e"].grad * (e1 - e0)).sum(dim=(1, 2)).detach()
+        return t.detach(), dt_dalpha, per_layer
 
     # only activations need gradients; a parameter gradient per pass would cost a model's worth of memory
     params = list(model.parameters())
@@ -219,13 +232,15 @@ def _integrate(
     qk = torch.zeros(n_layers, n_heads, dtype=torch.float64, device=device)
     ov = torch.zeros(n_layers, n_heads, dtype=torch.float64, device=device)
     previous = None
-    t_values = []
+    t_values: list[float] = []
+    derivatives: list[float] = []
     start = 0
     while start <= n_steps:
         # each batch starts one point back, so consecutive batches share an endpoint and every interval is covered
         chunk = alphas[start : start + points_per_batch]
-        t, per_layer = run_points(chunk)
+        t, dt_dalpha, per_layer = run_points(chunk)
         t_values.extend(t.tolist())
+        derivatives.extend(dt_dalpha.tolist())
         points = [
             [(r[k], g[k], a[k], v[k], gz[k]) for (r, g, a, v, gz) in per_layer]
             for k in range(len(chunk))
@@ -249,4 +264,6 @@ def _integrate(
         qk=qk.cpu(),
         ov=ov.cpu(),
         n_steps=n_steps,
+        t_path=torch.tensor(t_values, dtype=torch.float64),
+        dt_dalpha=torch.tensor(derivatives, dtype=torch.float64),
     )

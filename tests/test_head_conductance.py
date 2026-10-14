@@ -64,6 +64,12 @@ def test_every_cut_adds_up_to_the_measured_change():
     assert fine.qk.abs().max() > 1e-3 * abs(fine.delta), (
         "no pattern credit anywhere; the split is untested"
     )
+    # the path derivative integrates to the same change (the input end of the cut), and the path is recorded
+    integral = float(torch.trapezoid(fine.dt_dalpha, dx=1.0 / fine.n_steps))
+    assert integral == pytest.approx(fine.delta, rel=2e-3)
+    assert fine.t_path[0] == pytest.approx(t[0], rel=1e-5)
+    assert fine.t_path[-1] == pytest.approx(t[1], rel=1e-5)
+    assert len(fine.t_path) == len(fine.dt_dalpha) == fine.n_steps + 1
 
 
 def test_a_pattern_that_cannot_move_gets_no_pattern_credit():
