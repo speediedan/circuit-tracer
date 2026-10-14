@@ -88,6 +88,28 @@ def test_a_pattern_that_cannot_move_gets_no_pattern_credit():
     assert result.completeness_residual.abs().max() < 5e-3
 
 
+def test_key_position_split():
+    """The key-position parts are each part restricted to those keys: all keys give the whole, no keys give nothing,
+    and at layer 0 (values depend only on their own position's embedding) only the swapped keys' values move."""
+    model = _tiny()
+    swapped = [int(i) for i in torch.where(IDS_FROM != IDS_TO)[0]]
+    every = list(range(len(IDS_FROM)))
+    full = head_conductance(model, IDS_FROM, IDS_TO, WEIGHTS, n_steps=16, key_positions=every)
+    none = head_conductance(model, IDS_FROM, IDS_TO, WEIGHTS, n_steps=16, key_positions=[])
+    named = head_conductance(model, IDS_FROM, IDS_TO, WEIGHTS, n_steps=16, key_positions=swapped)
+    assert full.qk_keys is not None and full.ov_keys is not None
+    torch.testing.assert_close(full.qk_keys, full.qk, rtol=1e-9, atol=1e-12)
+    torch.testing.assert_close(full.ov_keys, full.ov, rtol=1e-9, atol=1e-12)
+    assert none.qk_keys is not None and none.ov_keys is not None
+    assert none.qk_keys.abs().max() == 0 and none.ov_keys.abs().max() == 0
+    assert named.ov_keys is not None
+    torch.testing.assert_close(named.ov_keys[0], named.ov[0], rtol=1e-9, atol=1e-12)
+    assert (named.ov - named.ov_keys)[1:].abs().max() > 1e-4 * abs(named.delta), (
+        "later layers' values never move"
+    )
+    assert head_conductance(model, IDS_FROM, IDS_TO, WEIGHTS, n_steps=4).ov_keys is None
+
+
 def test_refusals():
     with pytest.raises(ValueError, match="eager"):
         head_conductance(_tiny("sdpa"), IDS_FROM, IDS_TO, WEIGHTS)

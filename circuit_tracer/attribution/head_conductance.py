@@ -59,6 +59,10 @@ class HeadConductance:
         t_path: ``(n_steps + 1,)``: the target at every path point.
         dt_dalpha: ``(n_steps + 1,)``: the target's derivative along the path at every point, the gradient at the
             input embeddings dotted with their change. At the start it is the first-order prediction of the change.
+        qk_keys: ``(n_layers, n_heads)``, with ``key_positions`` only: the part of each head's pattern part that goes
+            through those key positions (attention shifting toward or away from them).
+        ov_keys: ``(n_layers, n_heads)``, with ``key_positions`` only: the part of each head's value part read from
+            those key positions (their values changing). ``qk - qk_keys`` and ``ov - ov_keys`` are the rest.
     """
 
     t_from: float
@@ -69,6 +73,8 @@ class HeadConductance:
     n_steps: int
     t_path: torch.Tensor
     dt_dalpha: torch.Tensor
+    qk_keys: torch.Tensor | None = None
+    ov_keys: torch.Tensor | None = None
 
     @property
     def first_order(self) -> float:
@@ -103,6 +109,7 @@ def head_conductance(
     target_weights: torch.Tensor,
     n_steps: int = 32,
     points_per_batch: int = 17,
+    key_positions: list[int] | None = None,
 ) -> HeadConductance:
     """Per-head conductance of every attention layer along the path from ``ids_from`` to ``ids_to``.
 
@@ -114,6 +121,8 @@ def head_conductance(
             +1 and -1 at the two tokens).
         n_steps: Trapezoid intervals along the path.
         points_per_batch: Path points per forward and backward pass (memory).
+        key_positions: Optional key positions, such as a swapped name's tokens, whose share of each head's pattern
+            and value parts is reported separately.
 
     Returns:
         A :class:`HeadConductance`.
@@ -215,8 +224,12 @@ def head_conductance(
     for p in params:
         p.requires_grad_(False)
     try:
+        key_mask = None
+        if key_positions is not None:
+            key_mask = torch.zeros(ids_from.shape[0], device=device, dtype=e0.dtype)
+            key_mask[list(key_positions)] = 1.0
         return _integrate(
-            run_points, n_layers, n_heads, n_steps, points_per_batch, device, e0.dtype
+            run_points, n_layers, n_heads, n_steps, points_per_batch, device, e0.dtype, key_mask
         )
     finally:
         for p, r in zip(params, requires):
@@ -224,13 +237,15 @@ def head_conductance(
 
 
 def _integrate(
-    run_points, n_layers, n_heads, n_steps, points_per_batch, device, dtype
+    run_points, n_layers, n_heads, n_steps, points_per_batch, device, dtype, key_mask=None
 ) -> HeadConductance:
     """Trapezoid accumulation of every cut's conductance over consecutive path points."""
     alphas = torch.linspace(0.0, 1.0, n_steps + 1, device=device, dtype=dtype)
     resid = torch.zeros(n_layers, dtype=torch.float64, device=device)
     qk = torch.zeros(n_layers, n_heads, dtype=torch.float64, device=device)
     ov = torch.zeros(n_layers, n_heads, dtype=torch.float64, device=device)
+    qk_keys = torch.zeros_like(qk) if key_mask is not None else None
+    ov_keys = torch.zeros_like(ov) if key_mask is not None else None
     previous = None
     t_values: list[float] = []
     derivatives: list[float] = []
@@ -253,8 +268,13 @@ def _integrate(
                 r1, g1, a1, v1, gz1 = points[k + 1][i]
                 resid[i] += (0.5 * (g0 + g1) * (r1 - r0)).sum().double()
                 g_bar = 0.5 * (gz0 + gz1)
-                qk[i] += (g_bar * ((a1 - a0) @ (0.5 * (v0 + v1)))).sum(dim=(-1, -2)).double()
-                ov[i] += (g_bar * ((0.5 * (a0 + a1)) @ (v1 - v0))).sum(dim=(-1, -2)).double()
+                d_a, a_bar = a1 - a0, 0.5 * (a0 + a1)
+                v_bar, d_v = 0.5 * (v0 + v1), v1 - v0
+                qk[i] += (g_bar * (d_a @ v_bar)).sum(dim=(-1, -2)).double()
+                ov[i] += (g_bar * (a_bar @ d_v)).sum(dim=(-1, -2)).double()
+                if key_mask is not None:  # the same parts through the chosen key columns only
+                    qk_keys[i] += (g_bar * ((d_a * key_mask) @ v_bar)).sum(dim=(-1, -2)).double()  # type: ignore[index]
+                    ov_keys[i] += (g_bar * ((a_bar * key_mask) @ d_v)).sum(dim=(-1, -2)).double()  # type: ignore[index]
         previous = points[-1]
         start += len(chunk)
     return HeadConductance(
@@ -266,4 +286,6 @@ def _integrate(
         n_steps=n_steps,
         t_path=torch.tensor(t_values, dtype=torch.float64),
         dt_dalpha=torch.tensor(derivatives, dtype=torch.float64),
+        qk_keys=None if qk_keys is None else qk_keys.cpu(),
+        ov_keys=None if ov_keys is None else ov_keys.cpu(),
     )
