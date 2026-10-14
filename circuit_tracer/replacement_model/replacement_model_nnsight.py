@@ -15,6 +15,7 @@ from circuit_tracer.attribution.context_nnsight import AttributionContext
 from circuit_tracer.transcoder import TranscoderSet
 from circuit_tracer.transcoder.cross_layer_transcoder import CrossLayerTranscoder
 from circuit_tracer.utils import get_default_device
+from circuit_tracer.utils.device_placement import check_materialized, model_devices
 from circuit_tracer.utils.hf_utils import load_transcoder_from_hub
 from circuit_tracer.utils.interventions import Intervention, convert_open_ended_interventions
 from circuit_tracer.utils.tl_nnsight_mapping import (
@@ -59,6 +60,8 @@ class NNSightReplacementModel(LanguageModel):
     skip_transcoder: bool
     scan_name: str | list[str] | None
     backend: Literal["nnsight"]
+    attribution_device: torch.device
+    split_devices: bool
 
     @classmethod
     def from_config(
@@ -92,6 +95,8 @@ class NNSightReplacementModel(LanguageModel):
         transcoders: TranscoderSet | CrossLayerTranscoder,
         device: torch.device | str = torch.device("cuda"),
         dtype: torch.dtype = torch.float32,
+        device_map: str | dict | None = None,
+        max_memory: dict | None = None,
         **kwargs,
     ) -> "NNSightReplacementModel":
         """Create a NNSightReplacementModel from the name of HookedTransformer and TranscoderSet
@@ -99,6 +104,14 @@ class NNSightReplacementModel(LanguageModel):
         Args:
             model_name (str): the name of the pretrained HookedTransformer
             transcoders (TranscoderSet): The transcoder set with configuration
+            device: where the model is loaded when ``device_map`` is None. With a ``device_map``
+                it is the attribution device instead: the transcoders and every attribution
+                tensor live there, while the model's layers follow the map.
+            device_map: split the model's layers across devices (``"sequential"`` or an explicit
+                map, with ``max_memory`` to cap each device). Every module must land on a real
+                device: a map that offloads any module to ``cpu`` or ``disk`` is refused, and
+                ``"auto"`` (balanced) does that on unequal GPUs.
+            max_memory: per-device memory caps for a string ``device_map``.
 
         Returns:
             NNSightReplacementModel: The loaded NNSightReplacementModel
@@ -128,7 +141,9 @@ class NNSightReplacementModel(LanguageModel):
             else:
                 dev_entry = dev_str  # "cpu" or other accelerator names
 
-        device_map = {"": dev_entry}
+        if device_map is None:
+            device_map = {"": dev_entry}
+        load_kwargs = {} if max_memory is None else {"max_memory": max_memory}
 
         config = AutoConfig.from_pretrained(model_name)
         if hasattr(config, "quantization_config"):
@@ -166,10 +181,17 @@ class NNSightReplacementModel(LanguageModel):
             dispatch=True,
             dtype=dtype,
             attn_implementation="eager",
+            **load_kwargs,
             **automodel_kwargs,
         )
 
-        model._configure_replacement_model(transcoders)
+        check_materialized(model._module)
+        attribution_device = (
+            torch.device("cuda", dev_entry)
+            if isinstance(dev_entry, int)
+            else torch.device(dev_entry)
+        )
+        model._configure_replacement_model(transcoders, attribution_device=attribution_device)
         return model
 
     @classmethod
@@ -233,6 +255,7 @@ class NNSightReplacementModel(LanguageModel):
     def _configure_replacement_model(
         self,
         transcoder_set: TranscoderSet | CrossLayerTranscoder,
+        attribution_device: torch.device | None = None,
     ):
         self.backend = "nnsight"
         self.eval()
@@ -242,7 +265,15 @@ class NNSightReplacementModel(LanguageModel):
         gemma_3_it = "gemma-3" in self.cfg.model_name and self.cfg.model_name.endswith("-it")
         self.zero_positions = slice(0, 4) if gemma_3_it else slice(0, 1)
 
-        transcoder_set.to(self.device, self.dtype)
+        # The transcoders and every attribution tensor live on one device. When the model's layers are split
+        # across devices, activations cross to this device at each hook and gradients cross back.
+        self.attribution_device = (
+            attribution_device
+            if attribution_device is not None
+            else cast(torch.device, self.device)
+        )
+        self.split_devices = len(model_devices(self._module)) > 1
+        transcoder_set.to(self.attribution_device, self.dtype)
         self.transcoders = transcoder_set
         self.skip_transcoder = transcoder_set.skip_connection
 
@@ -299,15 +330,22 @@ class NNSightReplacementModel(LanguageModel):
             self.transcoders._module if isinstance(self.transcoders, Envoy) else self.transcoders
         )
 
+        attribution_device = self.attribution_device
         with tracer.invoke():
             for layer, (feature_input_loc, feature_output_loc) in enumerate(
                 zip(self.feature_input_locs, self.feature_output_locs)
             ):
                 if transcoders.skip_connection:  # type: ignore
-                    skip = transcoders.compute_skip(layer, feature_input_loc.output)  # type: ignore
+                    skip = transcoders.compute_skip(  # type: ignore
+                        layer,
+                        feature_input_loc.output.to(attribution_device),  # type: ignore
+                    )
                 else:
                     skip = 0 * feature_input_loc.output.sum()  # type: ignore
-                feature_output_loc.output = skip + (feature_output_loc.output - skip).detach()  # type: ignore
+                output = feature_output_loc.output  # type: ignore
+                # `.to` is differentiable, so the skip's gradient still reaches the layer's input
+                skip = skip.to(output.device)  # type: ignore
+                feature_output_loc.output = skip + (output - skip).detach()  # type: ignore
                 if barrier:
                     barrier()
 
@@ -325,6 +363,7 @@ class NNSightReplacementModel(LanguageModel):
         activation_matrix = (
             [[] for _ in range(self.cfg.n_layers)] if append else [None] * self.cfg.n_layers
         )
+        attribution_device = self.attribution_device
 
         def fetch_activations(
             barrier: Barrier | None = None,
@@ -337,7 +376,7 @@ class NNSightReplacementModel(LanguageModel):
                 feature_input_loc = self.get_feature_input_loc(layer)
                 transcoder_acts = (
                     self.transcoders._module.encode_layer(  # type: ignore
-                        feature_input_loc.output,
+                        feature_input_loc.output.to(attribution_device),
                         layer,
                         apply_activation_function=apply_activation_function,
                     )
@@ -480,23 +519,25 @@ class NNSightReplacementModel(LanguageModel):
         mlp_out_cache = [None] * self.cfg.n_layers
 
         transcoders = self.transcoders
+        attribution_device = self.attribution_device
 
         with self.trace(tokens):
             mlp_in_cache, mlp_out_cache = [], []
             for feature_input_loc, feature_output_loc in zip(
                 self.feature_input_locs, self.feature_output_locs
             ):
-                mlp_in_cache.append(feature_input_loc.output)
+                mlp_in_cache.append(feature_input_loc.output.to(attribution_device))
 
                 # we expect a dummy dimension 0, but GPT-OSS doesn't have one, so we add it.
                 y = feature_output_loc.output
                 if y.ndim == 2:
                     y = y.unsqueeze(0)  # type: ignore
-                mlp_out_cache.append(y)
+                mlp_out_cache.append(y.to(attribution_device))
 
             mlp_in_cache = save(torch.cat(mlp_in_cache, dim=0))  # type: ignore
             mlp_out_cache = save(torch.cat(mlp_out_cache, dim=0))  # type: ignore
             logits = save(self.output.logits)
+        logits = logits.to(attribution_device)
 
         attribution_data = transcoders.compute_attribution_components(
             mlp_in_cache, self.zero_positions
@@ -506,9 +547,9 @@ class NNSightReplacementModel(LanguageModel):
         error_vectors = mlp_out_cache - attribution_data["reconstruction"]
 
         error_vectors[:, self.zero_positions] = 0
-        token_vectors = self.embed_weight[  # type: ignore
-            tokens
-        ].detach()  # (n_pos, d_model)  # type: ignore
+        token_vectors = (
+            self.embed_weight[tokens.to(self.embed_weight.device)].detach().to(attribution_device)
+        )  # (n_pos, d_model)
 
         return AttributionContext(
             activation_matrix=attribution_data["activation_matrix"],
@@ -556,6 +597,7 @@ class NNSightReplacementModel(LanguageModel):
         # This gets around it.
         transcoders = self.transcoders
         skip_transcoder = self.skip_transcoder
+        attribution_device = self.attribution_device
         trace_inputs = self._trace_input_tokens(inputs)
 
         # get transcoder activations and values to freeze to
@@ -580,9 +622,12 @@ class NNSightReplacementModel(LanguageModel):
                     # had when run on the inputs normally. We subtract out the skip that
                     # corresponds to such a run, and add in the skip with direct effects.
                     frozen_skip = transcoders.compute_skip(  # type: ignore
-                        layer, cache["feature_input", layer]
+                        layer, cache["feature_input", layer].to(attribution_device)
                     )
-                    normal_skip = transcoders.compute_skip(layer, loc_to_freeze.output)  # type: ignore
+                    normal_skip = transcoders.compute_skip(  # type: ignore
+                        layer,
+                        loc_to_freeze.output.to(attribution_device),  # type: ignore
+                    )
 
                     skip_diffs[layer] = normal_skip - frozen_skip
 
@@ -609,7 +654,9 @@ class NNSightReplacementModel(LanguageModel):
                         )
 
                     if freeze_loc_name == "feature_output" and skip_transcoder:
-                        loc_to_freeze.output = cached_values + skip_diffs[layer]
+                        loc_to_freeze.output = cached_values + skip_diffs[layer].to(
+                            cached_values.device  # type: ignore
+                        )
                     else:
                         loc_to_freeze.output = cached_values
 
@@ -658,7 +705,7 @@ class NNSightReplacementModel(LanguageModel):
         layer_deltas = torch.zeros(
             [self.cfg.n_layers, n_pos, self.cfg.d_model],
             dtype=self.dtype,
-            device=self.device,
+            device=self.attribution_device,
         )
         for layer in range(self.cfg.n_layers):
             if interventions_by_layer[layer]:
@@ -714,7 +761,9 @@ class NNSightReplacementModel(LanguageModel):
                 if direct_effects_barrier:
                     direct_effects_barrier()
                 transcoder_output = self.get_feature_output_loc(layer).output  # type: ignore
-                transcoder_output[:] = transcoder_output + layer_deltas[layer]  # type: ignore
+                transcoder_output[:] = transcoder_output + layer_deltas[layer].to(  # type: ignore
+                    transcoder_output.device  # type: ignore
+                )
                 layer_deltas[layer] *= 0
 
         return save(self.output.logits)

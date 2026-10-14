@@ -180,7 +180,8 @@ def _run_attribution(
     targets = AttributionTargets(
         attribution_targets=attribution_targets,
         logits=ctx.logits[0, -1],
-        unembed_proj=model.unembed_weight,
+        # a no-op unless a split placed the unembedding away from the attribution device
+        unembed_proj=model.unembed_weight.to(ctx.logits.device),
         tokenizer=model.tokenizer,
         max_n_logits=max_n_logits,
         desired_logit_prob=desired_logit_prob,

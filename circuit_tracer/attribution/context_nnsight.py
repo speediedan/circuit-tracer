@@ -115,8 +115,10 @@ class AttributionContext:
         """
 
         proxy = weakref.proxy(self)
+        # under a layer split the gradient arrives on its layer's device; the vectors and the buffer
+        # live on the attribution device
         proxy._batch_buffer[write_index] += einsum(
-            grads.to(output_vecs.dtype)[read_index],
+            grads.to(device=output_vecs.device, dtype=output_vecs.dtype)[read_index],
             output_vecs,
             "batch position d_model, position d_model -> position batch",
         )
@@ -200,7 +202,11 @@ class AttributionContext:
 
         def _inject(grad_point, *, batch_indices, pos_indices, values):
             grads_out = grad_point.grad.clone()
-            grads_out.index_put_((batch_indices, pos_indices), values.to(grads_out.dtype))
+            device = grads_out.device
+            grads_out.index_put_(
+                (batch_indices.to(device), pos_indices.to(device)),
+                values.to(device=device, dtype=grads_out.dtype),
+            )
             grad_point.grad = grads_out
 
         if block_output is None:
