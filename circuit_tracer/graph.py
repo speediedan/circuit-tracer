@@ -28,6 +28,7 @@ class Graph:
     cfg: UnifiedConfig
     scan_name: str | list[str] | None
     n_pos: int
+    attribution_regime: dict[str, bool]
 
     def __init__(
         self,
@@ -42,6 +43,7 @@ class Graph:
         logit_probabilities: torch.Tensor,
         scan_name: str | list[str] | None = None,
         vocab_size: int | None = None,
+        attribution_regime: dict[str, bool] | None = None,
     ):
         """
         A graph object containing the adjacency matrix describing the direct effect of each
@@ -71,6 +73,10 @@ class Graph:
                 transcoders used in the graph. Without a scan_name, the graph cannot be uploaded
                 (since we won't know what transcoders were used). Defaults to None
             vocab_size: Vocabulary size. If not provided, defaults to cfg.d_vocab.
+            attribution_regime: What the local replacement model held constant
+                (``freeze_attention``, ``freeze_norms``). With both True, the default and the
+                only regime before they existed, edges are exact direct effects; with either
+                False they are first-order.
         """
         self.logit_targets = logit_targets
         self.logit_probabilities = logit_probabilities
@@ -88,6 +94,11 @@ class Graph:
         self.scan_name = scan_name
         self.selected_features = selected_features
         self.activation_values = activation_values
+        self.attribution_regime = (
+            dict(attribution_regime)
+            if attribution_regime is not None
+            else {"freeze_attention": True, "freeze_norms": True}
+        )
 
     def to(self, device):
         """Send all relevant tensors to the device (cpu, cuda, etc.)
@@ -150,6 +161,7 @@ class Graph:
             "selected_features": self.selected_features,
             "activation_values": self.activation_values,
             "scan_name": self.scan_name,
+            "attribution_regime": self.attribution_regime,
         }
         torch.save(d, path)
 

@@ -312,18 +312,30 @@ class NNSightReplacementModel(LanguageModel):
         for param in self.parameters():
             param.requires_grad = False
 
-    def configure_gradient_flow(self, tracer):
+    def configure_gradient_flow(
+        self, tracer, freeze_attention: bool = True, freeze_norms: bool = True
+    ):
+        """Detach what the local replacement model holds constant.
+
+        With attention patterns and norm scales both frozen (the default) the replacement model is linear in the
+        residual stream, so every edge is an exact direct effect. Leaving the patterns live keeps the gradient through
+        the queries and keys, so a node is also credited for changing where attention looks; the edges are then
+        first-order (exact only for small changes). Norm scales, QK norms included, stay frozen unless
+        ``freeze_norms`` is False.
+        """
         with tracer.invoke():
             self.embed_location.output.requires_grad = True  # type: ignore
 
-        with tracer.invoke():
-            for freeze_loc in self.attention_locs:
-                freeze_loc.output = freeze_loc.output.detach()  # type: ignore
-
-        for layernorm_scale_locs_list in self.layernorm_scale_locs:
+        if freeze_attention:
             with tracer.invoke():
-                for freeze_loc in layernorm_scale_locs_list:
+                for freeze_loc in self.attention_locs:
                     freeze_loc.output = freeze_loc.output.detach()  # type: ignore
+
+        if freeze_norms:
+            for layernorm_scale_locs_list in self.layernorm_scale_locs:
+                with tracer.invoke():
+                    for freeze_loc in layernorm_scale_locs_list:
+                        freeze_loc.output = freeze_loc.output.detach()  # type: ignore
 
     def configure_skip_connection(self, tracer, barrier=None):
         transcoders = (
@@ -563,7 +575,11 @@ class NNSightReplacementModel(LanguageModel):
         )
 
     def setup_intervention_with_freeze(
-        self, inputs: str | torch.Tensor, constrained_layers: range | None = None
+        self,
+        inputs: str | torch.Tensor,
+        constrained_layers: range | None = None,
+        freeze_attention: bool = True,
+        freeze_norms: bool = True,
     ) -> tuple[torch.Tensor, list[Callable]]:
         """Sets up an intervention with either frozen attention + LayerNorm(default) or frozen
         attention, LayerNorm, and MLPs, for constrained layers
@@ -573,6 +589,10 @@ class NNSightReplacementModel(LanguageModel):
             constrained_layers (range | None): whether to apply interventions only to a certain range.
                 Mostly applicable to CLTs. If the given range includes all model layers, we also freeze
                 layernorm denominators, computing direct effects. None means no constraints (iterative patching)
+            freeze_attention (bool): hold the attention patterns at their clean values. False measures the
+                response a patterns-live attribution graph's edges describe.
+            freeze_norms (bool): hold the norm denominators at their clean values when every layer is
+                constrained. False measures the response a free-norm graph's edges describe.
 
         Returns:
             tuple[torch.Tensor, list[Callable]]: The freeze hooks needed to run the desired intervention.
@@ -580,9 +600,9 @@ class NNSightReplacementModel(LanguageModel):
 
         def get_locs_to_freeze():
             # this needs to go in a function that is called only in a trace context! otherwise you can't get the .source twice
-            locs_to_freeze = {"attention": self.attention_locs}
+            locs_to_freeze = {"attention": self.attention_locs} if freeze_attention else {}
             if constrained_layers:
-                if set(range(self.cfg.n_layers)).issubset(set(constrained_layers)):  # type: ignore
+                if freeze_norms and set(range(self.cfg.n_layers)).issubset(set(constrained_layers)):  # type: ignore
                     for i, layernorm_freeze_loc in enumerate(self.layernorm_scale_locs):
                         locs_to_freeze[f"layernorm-{i}"] = layernorm_freeze_loc
                 if self.skip_transcoder:
@@ -778,6 +798,7 @@ class NNSightReplacementModel(LanguageModel):
         apply_activation_function: bool = True,
         sparse: bool = False,
         return_activations: bool = True,
+        freeze_norms: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Given the input, and a dictionary of features to intervene on, performs the
         intervention, allowing all effects to propagate (optionally allowing its effects to
@@ -791,6 +812,9 @@ class NNSightReplacementModel(LanguageModel):
                 all MLPs within the layer range before doing so. This is mostly applicable to CLTs. If the given
                 range includes all model layers, we also freeze layernorm denominators, computing direct effects.
                 None means no constraints (iterative patching)
+            freeze_attention (bool): hold the attention patterns at their clean values. Honored with
+                ``constrained_layers`` too: False there measures the direct effects a patterns-live
+                attribution graph describes.
             apply_activation_function (bool): whether to apply the activation function when
                 recording the activations to be returned. This is useful to set to False for
                 testing purposes, as attribution predicts the change in pre-activation
@@ -801,6 +825,8 @@ class NNSightReplacementModel(LanguageModel):
                 activation computation is skipped for layers not being intervened on (when
                 constrained_layers is not set), saving time. Activations are not returned.
                 Defaults to True.
+            freeze_norms (bool): with every layer constrained, hold the norm denominators at their
+                clean values (the default, matching a frozen-norm graph). False matches a free-norm graph.
         """
         activation_matrix, activation_fn = self.get_activation_fn(
             apply_activation_function=apply_activation_function, sparse=sparse
@@ -808,7 +834,10 @@ class NNSightReplacementModel(LanguageModel):
 
         if (freeze_attention or constrained_layers) and interventions:
             original_activations, freeze_fns = self.setup_intervention_with_freeze(
-                inputs, constrained_layers=constrained_layers
+                inputs,
+                constrained_layers=constrained_layers,
+                freeze_attention=freeze_attention,
+                freeze_norms=freeze_norms,
             )
         else:
             original_activations, freeze_fns = None, []

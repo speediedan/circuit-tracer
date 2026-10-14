@@ -50,6 +50,8 @@ def attribute(
     offload: Literal["cpu", "disk", None] = None,
     verbose: bool = False,
     update_interval: int = 4,
+    freeze_attention: bool = True,
+    freeze_norms: bool = True,
 ) -> Graph:
     """Compute an attribution graph for *prompt* using NNSight backend.
 
@@ -73,6 +75,10 @@ def attribute(
                  or None (no offloading).
         verbose: Whether to show progress information.
         update_interval: Number of batches to process before updating the feature ranking.
+        freeze_attention: Hold attention patterns constant (the default), so edges are exact direct
+            effects. False keeps the gradient through queries and keys: a node is also credited for
+            changing where attention looks, and edges become first-order.
+        freeze_norms: Hold every norm scale constant (the default), QK norms included.
 
     Returns:
         Graph: Fully dense adjacency (unpruned).
@@ -105,6 +111,8 @@ def attribute(
             offload_handles=offload_handles,
             update_interval=update_interval,
             logger=logger,
+            freeze_attention=freeze_attention,
+            freeze_norms=freeze_norms,
         )
     finally:
         for reload_handle in offload_handles:
@@ -127,6 +135,8 @@ def _run_attribution(
     offload_handles,
     logger,
     update_interval: int = 4,
+    freeze_attention: bool = True,
+    freeze_norms: bool = True,
 ):
     start_time = time.time()
     # Phase 0: precompute
@@ -152,7 +162,9 @@ def _run_attribution(
 
         detach_barrier = tracer.barrier(2)
 
-        model.configure_gradient_flow(tracer)
+        model.configure_gradient_flow(
+            tracer, freeze_attention=freeze_attention, freeze_norms=freeze_norms
+        )
         model.configure_skip_connection(tracer, barrier=detach_barrier)
         ctx.cache_residual(
             model,
@@ -305,6 +317,7 @@ def _run_attribution(
         adjacency_matrix=full_edge_matrix.detach(),
         cfg=model.config,
         scan_name=model.scan_name,
+        attribution_regime={"freeze_attention": freeze_attention, "freeze_norms": freeze_norms},
     )
 
     total_time = time.time() - start_time

@@ -32,6 +32,8 @@ def attribute(
     offload: Literal["cpu", "disk", None] = None,
     verbose: bool = False,
     update_interval: int = 4,
+    freeze_attention: bool = True,
+    freeze_norms: bool = True,
 ) -> Graph:
     """Compute an attribution graph for *prompt*.
 
@@ -58,10 +60,21 @@ def attribute(
                  or None (no offloading).
         verbose: Whether to show progress information.
         update_interval: Number of batches to process before updating the feature ranking.
+        freeze_attention: Hold attention patterns constant (the default), so edges are exact direct
+            effects. False (nnsight backend only) also credits nodes for changing where attention
+            looks, and edges become first-order.
+        freeze_norms: Hold every norm scale constant (the default), QK norms included. False is
+            nnsight backend only.
 
     Returns:
         Graph: Fully dense adjacency (unpruned).
     """
+
+    if (not freeze_attention or not freeze_norms) and model.backend != "nnsight":
+        raise ValueError(
+            "freeze_attention=False and freeze_norms=False are implemented for the nnsight backend only; "
+            f"got backend {model.backend!r}"
+        )
 
     if model.backend == "interp_engine":
         from .attribute_interp_engine import attribute as attribute_interp_engine
@@ -92,6 +105,8 @@ def attribute(
             offload=offload,
             verbose=verbose,
             update_interval=update_interval,
+            freeze_attention=freeze_attention,
+            freeze_norms=freeze_norms,
         )
     else:
         from .attribute_transformerlens import attribute as attribute_transformerlens
