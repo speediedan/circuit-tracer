@@ -15,6 +15,10 @@ from circuit_tracer import ReplacementModel, attribute
 from circuit_tracer.transcoder import SingleLayerTranscoder, TranscoderSet
 from circuit_tracer.transcoder.activation_functions import JumpReLU
 from circuit_tracer.utils.device_placement import check_materialized, placement_summary
+from tests.test_attributions_gemma3_nnsight import (
+    initialize_transcoder_weights,
+    set_l0_via_thresholds,
+)
 
 two_cuda_devices = torch.cuda.is_available() and torch.cuda.device_count() >= 2
 
@@ -96,22 +100,22 @@ def test_placement_summary_counts_per_device():
     )
 
 
-def _dummy_transcoders(cfg, seed: int = 0) -> TranscoderSet:
-    gen = torch.Generator().manual_seed(seed)
+def _dummy_transcoders(cfg) -> TranscoderSet:
+    """Skip transcoders with the fork's test initialization; thresholds are calibrated per model afterwards."""
     transcoders = {}
     for layer in range(cfg.num_hidden_layers):
         tc = SingleLayerTranscoder(
             cfg.hidden_size,
             cfg.hidden_size * 4,
-            JumpReLU(torch.full((cfg.hidden_size * 4,), 0.5), 0.1),
+            JumpReLU(torch.zeros(cfg.hidden_size * 4), 0.1),
             layer,
             skip_connection=True,
             device=torch.device("cpu"),
             dtype=torch.float32,
         )
-        for param in tc.parameters():
-            with torch.no_grad():
-                param.copy_(torch.rand(param.shape, generator=gen) * 0.2 - 0.1)
+        initialize_transcoder_weights(tc.W_enc, tc.W_dec, tc.b_enc, tc.b_dec)
+        with torch.no_grad():
+            nn.init.uniform_(tc.W_skip, a=-0.01, b=0.01)  # type: ignore[arg-type]
         transcoders[layer] = tc
     return TranscoderSet(
         transcoders, feature_input_hook="hook_resid_mid", feature_output_hook="hook_mlp_out"
@@ -147,9 +151,19 @@ def test_split_graph_matches_single_device():
     cfg = AutoConfig.from_pretrained(model_name)
     prompt = "The National Digital Analytics Group (ND"
 
+    # one transcoder set for both loads: calibrated once (about 16 active features per position, as the fork's
+    # other dummy-transcoder tests do), so the two graphs differ only in where the model's layers live
+    transcoders = _dummy_transcoders(cfg)
     single = ReplacementModel.from_pretrained_and_transcoders(
-        model_name, _dummy_transcoders(cfg), backend="nnsight", device=torch.device("cuda:0")
+        model_name, transcoders, backend="nnsight", device=torch.device("cuda:0")
     )
+    _, calibration_acts = single.get_activations(prompt)
+    for layer, transcoder in enumerate(transcoders):
+        set_l0_via_thresholds(
+            calibration_acts[layer : layer + 1],
+            transcoder.activation_function.threshold,
+            target_l0=16,
+        )
     graph_single = attribute(prompt, single, batch_size=64)
     logits_single, acts_single = single.get_activations(prompt)
     del single
@@ -157,7 +171,7 @@ def test_split_graph_matches_single_device():
 
     split = ReplacementModel.from_pretrained_and_transcoders(
         model_name,
-        _dummy_transcoders(cfg),
+        transcoders,
         backend="nnsight",
         device=torch.device("cuda:0"),
         device_map=_split_map(cfg.num_hidden_layers, cfg.num_hidden_layers // 2),
