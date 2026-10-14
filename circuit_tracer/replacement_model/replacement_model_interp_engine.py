@@ -1051,13 +1051,14 @@ class InterpEngineReplacementModel(nn.Module):
 
         error_vectors = feature_out - attribution_data["reconstruction"]
         error_vectors[:, self.zero_positions] = 0
-        # Raw embedding rows, matching the NNSight backend. On Gemma these are sqrt(d_model) times
-        # smaller than TransformerLens reports, because TL folds that normalizer into `W_E` while HF
-        # applies it as a separate multiply after `embed_tokens`. The gradient is read on the
-        # pre-multiply tensor, so the factor cancels and token attributions still agree with TL to
-        # float precision; only this public vector differs, and it differs the same way NNSight's
-        # already does.
-        token_vectors = self.embed_weight[tokens].detach()
+        # The token nodes' vectors are the tensor the embedding hook made a gradient source, so each token
+        # edge is that tensor's gradient times the tensor itself. Raw embedding rows match it only where the
+        # model scales embeddings after the embedding module; Gemma 2 and 3 scale by sqrt(d_model) inside it.
+        if self._embed_tensor is None:
+            raise RuntimeError(
+                "the embedding hook captured no tensor; token attributions have no source vector"
+            )
+        token_vectors = self._embed_tensor[0].detach()
 
         return AttributionContext(
             activation_matrix=attribution_data["activation_matrix"],

@@ -10,7 +10,6 @@ freeze that silently stopped holding.
 """
 
 import gc
-import math
 
 import pytest
 import torch
@@ -186,20 +185,14 @@ def test_attribution_context_consistency(tl, ie):
     _assert_close(ie["encoder_vecs"], tl["encoder_vecs"], "Encoder vectors", atol=1e-4)
 
 
-def test_token_vectors_differ_only_by_the_embedding_normalizer(tl, ie):
-    """Pins the one convention the backends genuinely do not share.
+def test_token_vectors_include_the_embedding_normalizer(tl, ie):
+    """Both backends report the embedding the model actually adds to the residual stream.
 
-    transformerlens folds Gemma's ``sqrt(d_model)`` embedding normalizer into ``W_E``; Hugging Face
-    applies it as a separate multiply after ``embed_tokens``, and both interp_engine and nnsight
-    report the raw embedding row. interp_engine reads its token gradient on the pre-multiply tensor,
-    so the factor cancels and token attributions still match -- which
-    :func:`test_attribution_graph_consistency` checks. Asserting the exact factor here keeps that
-    reasoning honest: if the normalizer ever moved, this fails loudly instead of the graph drifting.
+    transformerlens folds Gemma's ``sqrt(d_model)`` embedding normalizer into ``W_E``; Hugging Face applies it inside
+    the embedding module, whose output is where interp_engine reads token gradients. A token node built from the raw
+    embedding row would be ``sqrt(d_model)`` times too small against that gradient, so the vectors must agree.
     """
-    d_model = tl["token_vectors"].shape[-1]
-    _assert_close(
-        ie["token_vectors"] * math.sqrt(d_model), tl["token_vectors"], "Token vectors", atol=1e-3
-    )
+    _assert_close(ie["token_vectors"], tl["token_vectors"], "Token vectors", atol=1e-3)
 
 
 def test_attribution_graph_consistency(tl, ie):
