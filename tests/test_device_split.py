@@ -100,7 +100,7 @@ def test_placement_summary_counts_per_device():
     )
 
 
-def _dummy_transcoders(cfg) -> TranscoderSet:
+def _dummy_transcoders(cfg, dtype: torch.dtype = torch.float32) -> TranscoderSet:
     """Skip transcoders with the fork's test initialization; thresholds are calibrated per model afterwards."""
     transcoders = {}
     for layer in range(cfg.num_hidden_layers):
@@ -111,7 +111,7 @@ def _dummy_transcoders(cfg) -> TranscoderSet:
             layer,
             skip_connection=True,
             device=torch.device("cpu"),
-            dtype=torch.float32,
+            dtype=dtype,
         )
         initialize_transcoder_weights(tc.W_enc, tc.W_dec, tc.b_enc, tc.b_dec)
         with torch.no_grad():
@@ -151,11 +151,16 @@ def test_split_graph_matches_single_device():
     cfg = AutoConfig.from_pretrained(model_name)
     prompt = "The National Digital Analytics Group (ND"
 
+    # float64, because the two GPUs here can differ in architecture: in float32 their kernels disagree by up to
+    # about 1e-3 on a few activations (measured 6.4e-4 on 2 of 368,640, an sm_75 card against an sm_89 one), which
+    # says nothing about the split. In float64 that noise falls far below the tolerances below, while a misplaced
+    # tensor or a broken gradient path would still miss them by orders of magnitude.
+    dtype = torch.float64
     # one transcoder set for both loads: calibrated once (about 16 active features per position, as the fork's
     # other dummy-transcoder tests do), so the two graphs differ only in where the model's layers live
-    transcoders = _dummy_transcoders(cfg)
+    transcoders = _dummy_transcoders(cfg, dtype)
     single = ReplacementModel.from_pretrained_and_transcoders(
-        model_name, transcoders, backend="nnsight", device=torch.device("cuda:0")
+        model_name, transcoders, backend="nnsight", device=torch.device("cuda:0"), dtype=dtype
     )
     _, calibration_acts = single.get_activations(prompt)
     for layer, transcoder in enumerate(transcoders):
@@ -174,6 +179,7 @@ def test_split_graph_matches_single_device():
         transcoders,
         backend="nnsight",
         device=torch.device("cuda:0"),
+        dtype=dtype,
         device_map=_split_map(cfg.num_hidden_layers, cfg.num_hidden_layers // 2),
     )
     assert split.split_devices
@@ -182,11 +188,12 @@ def test_split_graph_matches_single_device():
     logits_split, acts_split = split.get_activations(prompt)
 
     torch.testing.assert_close(
-        logits_split.to(logits_single.device), logits_single, rtol=1e-4, atol=1e-4
+        logits_split.to(logits_single.device), logits_single, rtol=1e-7, atol=1e-7
     )
-    torch.testing.assert_close(acts_split.to(acts_single.device), acts_single, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(acts_split.to(acts_single.device), acts_single, rtol=1e-7, atol=1e-7)
     assert torch.equal(graph_split.active_features, graph_single.active_features)
     assert torch.equal(graph_split.logit_token_ids, graph_single.logit_token_ids)
+    # the graph stores edges in float32, so a float64 disagreement surfaces at most as a last-bit rounding difference
     torch.testing.assert_close(
-        graph_split.adjacency_matrix, graph_single.adjacency_matrix, rtol=1e-3, atol=1e-4
+        graph_split.adjacency_matrix, graph_single.adjacency_matrix, rtol=1e-6, atol=1e-8
     )
