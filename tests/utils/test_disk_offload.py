@@ -112,6 +112,23 @@ def test_disk_offload_writes_a_closed_file(plt_module, monkeypatch):
     assert held == [False]
 
 
+@pytest.mark.skipif(not os.path.exists("/proc/self/maps"), reason="needs /proc to read mappings")
+def test_disk_offload_reload_leaves_the_file_unmapped(plt_module):
+    """Windows refuses to delete a mapped file (os error 5), so the reloaded tensors must not map it.
+
+    Linux unlinks a mapped file without complaint, so this asks the question Windows would: once
+    the reload is done, does anything in this process still map the offload file?
+    """
+    orig_param = next(plt_module.parameters()).data.clone()
+    before = set(disk_offload._offload_files)
+    reload_handle = disk_offload_module(plt_module)
+    (path,) = disk_offload._offload_files - before
+    reload_handle()
+    with open("/proc/self/maps") as maps:
+        assert path not in maps.read()
+    assert torch.allclose(next(plt_module.parameters()).data, orig_param)
+
+
 @pytest.mark.parametrize("module_fixture", ["clt_module", "plt_module"])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_cpu_offload_module_cuda(module_fixture, request):
