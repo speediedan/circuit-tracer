@@ -30,17 +30,20 @@ def cleanup_all_offload_files():
 
 def disk_offload_module(module):
     org_device = next(module.parameters()).device
-    with tempfile.NamedTemporaryFile(prefix=_TEMP_PREFIX, delete=False) as f:
-        save_file(module.state_dict(), f.name)
-        _offload_files.add(f.name)
+    # safetensors opens the path itself, and Windows refuses a second open of a file still held
+    # open, so the descriptor is closed before anything is written.
+    fd, path = tempfile.mkstemp(prefix=_TEMP_PREFIX)
+    os.close(fd)
+    save_file(module.state_dict(), path)
+    _offload_files.add(path)
 
     module.to(device="meta")
 
     def reload_handle(device=None):
         target_device = str(device or org_device)
-        module.load_state_dict(load_file(f.name, device=target_device), assign=True)
-        os.remove(f.name)
-        _offload_files.remove(f.name)
+        module.load_state_dict(load_file(path, device=target_device), assign=True)
+        os.remove(path)
+        _offload_files.remove(path)
 
     return reload_handle
 

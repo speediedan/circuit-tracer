@@ -1,12 +1,14 @@
 """Tests for disk_offload module functions."""
 
 import gc
+import os
 
 import pytest
 import torch
 
 from circuit_tracer.transcoder.cross_layer_transcoder import CrossLayerTranscoder
 from circuit_tracer.transcoder.single_layer_transcoder import SingleLayerTranscoder
+from circuit_tracer.utils import disk_offload
 from circuit_tracer.utils.disk_offload import (
     cleanup_all_offload_files,
     cpu_offload_module,
@@ -78,6 +80,36 @@ def test_disk_offload_module(module_fixture, explicit_device, request):
         # Should be restored to original device
         assert next(module.parameters()).device.type == orig_device.type
         assert torch.allclose(next(module.parameters()).data, orig_param)
+
+
+def _open_paths() -> set[str]:
+    """The paths this process holds open, read from /proc/self/fd."""
+    paths = set()
+    for fd in os.listdir("/proc/self/fd"):
+        try:
+            paths.add(os.readlink(f"/proc/self/fd/{fd}"))
+        except OSError:  # the descriptor os.listdir itself used is gone by now
+            pass
+    return paths
+
+
+@pytest.mark.skipif(not os.path.isdir("/proc/self/fd"), reason="needs /proc to read open files")
+def test_disk_offload_writes_a_closed_file(plt_module, monkeypatch):
+    """Windows refuses the writer's own open while another handle holds the file (os error 5).
+
+    Only Windows fails on the write itself, so this asks the question the platform would: is the
+    file already open when the writer is handed its path?
+    """
+    held = []
+    real_save = disk_offload.save_file
+
+    def spy_save(state, path):
+        held.append(path in _open_paths())
+        real_save(state, path)
+
+    monkeypatch.setattr(disk_offload, "save_file", spy_save)
+    disk_offload_module(plt_module)()
+    assert held == [False]
 
 
 @pytest.mark.parametrize("module_fixture", ["clt_module", "plt_module"])
