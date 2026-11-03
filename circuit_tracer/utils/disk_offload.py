@@ -41,7 +41,12 @@ def disk_offload_module(module):
 
     def reload_handle(device=None):
         target_device = str(device or org_device)
-        module.load_state_dict(load_file(path, device=target_device), assign=True)
+        state_dict = load_file(path, device=target_device)
+        # CPU tensors from load_file stay memory-mapped to the file, and Windows refuses to delete a
+        # mapped file, so they are copied out and the mapping dropped first.
+        if target_device.startswith("cpu"):
+            state_dict = {name: tensor.clone() for name, tensor in state_dict.items()}
+        module.load_state_dict(state_dict, assign=True)
         os.remove(path)
         _offload_files.remove(path)
 
