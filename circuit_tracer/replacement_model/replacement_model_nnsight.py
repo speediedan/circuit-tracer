@@ -252,6 +252,18 @@ class NNSightReplacementModel(LanguageModel):
                 current = getattr(current, token)
         return current
 
+    def to(self, device: torch.device):
+        """Move the model and the transcoders it holds, and the attribution device with them.
+
+        Attribution sends each activation to the attribution device before the transcoders read it,
+        so a device recorded at load and left behind here would send activations away from the
+        transcoders that just moved.
+        """
+        moved = super().to(device)
+        self.attribution_device = next(iter(self.transcoders.parameters())).device
+        self.split_devices = len(model_devices(self._module)) > 1
+        return moved
+
     def _configure_replacement_model(
         self,
         transcoder_set: TranscoderSet | CrossLayerTranscoder,

@@ -137,6 +137,26 @@ def test_from_pretrained_records_attribution_device():
     assert {p.device for p in model.transcoders.parameters()} == {torch.device("cpu")}
 
 
+def test_moving_the_model_moves_the_attribution_device():
+    """Moving a loaded model takes its transcoders along, so the attribution device goes too.
+
+    It was recorded at load and stayed there, which sent activations back to the old device while
+    the transcoders reading them had moved. The meta device stands in for a second real device, so
+    this runs without a GPU.
+    """
+    cfg = AutoConfig.from_pretrained("google/gemma-3-270m")
+    model = ReplacementModel.from_pretrained_and_transcoders(
+        "google/gemma-3-270m",
+        _dummy_transcoders(cfg),
+        backend="nnsight",
+        device=torch.device("cpu"),
+    )
+    assert model.attribution_device == torch.device("cpu")
+    model.to(torch.device("meta"))
+    assert {p.device for p in model.transcoders.parameters()} == {torch.device("meta")}
+    assert model.attribution_device == torch.device("meta")
+
+
 def _split_map(n_layers: int, first_on_1: int) -> dict:
     """Layers from ``first_on_1`` onward, and the final norm, on cuda:1; the rest (embedding, tied head) on cuda:0."""
     device_map = {"model.embed_tokens": 0, "model.rotary_emb": 0, "lm_head": 0, "model.norm": 1}
