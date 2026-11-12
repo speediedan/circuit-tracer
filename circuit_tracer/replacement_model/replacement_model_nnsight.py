@@ -470,6 +470,12 @@ class NNSightReplacementModel(LanguageModel):
             logits = save(logits)  # type: ignore
             activation_cache = save(activation_cache)  # type: ignore
 
+        # Saved values keep the inference tensor flavour of the mode above in nnsight 0.8,
+        # and callers legitimately edit captured activations in place: hand back normal tensors.
+        if logits.is_inference():
+            logits = logits.clone()
+        if activation_cache.is_inference():
+            activation_cache = activation_cache.clone()
         return logits, activation_cache
 
     @contextmanager
