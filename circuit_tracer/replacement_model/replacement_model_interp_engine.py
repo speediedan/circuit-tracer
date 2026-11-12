@@ -4,7 +4,7 @@ The other two backends reach their hook points through a framework that has alre
 the model: TransformerLens rewrites the checkpoint into ``HookedTransformer``'s own module tree,
 and nnsight traces into the HF tree using per-architecture accessor strings (see
 ``utils/tl_nnsight_mapping.py``, where ``Gemma2ForCausalLM``'s attention pattern is spelled
-``model.layers[{layer}].self_attn.source.attention_interface_0.source.nn_functional_dropout_0``).
+``model.layers[{layer}].self_attn.source.attention_interface_1.source.nn_functional_dropout_0``).
 Both work; both need a hand-written table entry per architecture before a model can be traced.
 
 This backend runs the unmodified HF model and resolves the same structural roles by *inspecting*
