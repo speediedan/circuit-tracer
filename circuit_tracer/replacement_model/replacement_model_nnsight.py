@@ -7,7 +7,7 @@ from typing import Callable, Iterator, Literal, cast
 import torch
 from nnsight import CONFIG as NNSIGHT_CONFIG
 from nnsight import Envoy, LanguageModel, save
-from nnsight.intervention.tracing.tracer import Barrier
+from nnsight.intervention.barrier import Barrier
 from torch import nn
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
@@ -25,8 +25,8 @@ from circuit_tracer.utils.tl_nnsight_mapping import (
 from circuit_tracer.utils.tokenization import ensure_tokenized
 
 NNSIGHT_CONFIG.APP.PYMOUNT = False
-NNSIGHT_CONFIG.APP.CROSS_INVOKER = False
-NNSIGHT_CONFIG.APP.TRACE_CACHING = True
+# nnsight 0.8 removed the CROSS_INVOKER and TRACE_CACHING switches: trace caching is
+# always enabled, and cross-invoker value access is no longer switchable.
 
 
 class EnvoyWrapper:
