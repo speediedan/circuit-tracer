@@ -341,7 +341,8 @@ class TransformerLensReplacementModel(HookedTransformer):
             sparse=sparse,
             apply_activation_function=apply_activation_function,
         )
-        with torch.inference_mode(), self.hooks(activation_hooks):  # type: ignore
+        # no_grad, not inference_mode: see the nnsight backend's get_activations.
+        with torch.no_grad(), self.hooks(activation_hooks):  # type: ignore
             logits = self(inputs)
         activation_cache = torch.stack(activation_cache)
         if sparse:

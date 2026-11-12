@@ -465,7 +465,10 @@ class NNSightReplacementModel(LanguageModel):
             sparse=sparse, apply_activation_function=apply_activation_function
         )
         trace_inputs = self._trace_input_tokens(inputs)
-        with torch.inference_mode(), self.trace(trace_inputs):
+        # no_grad, not inference_mode: inference tensors cannot be edited in place by
+        # callers, and an FSDP unshard first allocated under inference mode poisons the
+        # param group's cached buffer for every later copy-out outside it.
+        with torch.no_grad(), self.trace(trace_inputs):
             logits, activation_cache = fetch_activations()  # type:ignore
             logits = save(logits)  # type: ignore
             activation_cache = save(activation_cache)  # type: ignore
