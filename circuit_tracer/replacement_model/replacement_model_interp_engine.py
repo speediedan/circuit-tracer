@@ -645,6 +645,10 @@ class InterpEngineReplacementModel(nn.Module):
             **kwargs,
         )
         _select_frozen_attention(engine.hf_model)
+        # As `from_pretrained_and_transcoders` does, and as the nnsight backend ends up: transcoders built at their own
+        # default dtype (bfloat16) would otherwise read a float32 model's residual in bfloat16, silently.
+        reference = next(engine.hf_model.parameters())
+        transcoders.to(reference.device, reference.dtype)
         return cls(engine, transcoders)
 
     def _configure_replacement_model(self) -> None:
