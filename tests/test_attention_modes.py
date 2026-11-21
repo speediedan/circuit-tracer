@@ -157,7 +157,7 @@ def test_the_regime_is_recorded_and_survives_a_round_trip(small_model, tmp_path)
     }
 
 
-@pytest.mark.parametrize("backend", ["transformerlens", "interp_engine"])
-def test_live_regimes_are_refused_on_other_backends(backend):
-    with pytest.raises(ValueError, match="nnsight backend only"):
-        attribute(TOKENS, SimpleNamespace(backend=backend), freeze_attention=False)  # type: ignore[arg-type]
+def test_live_regimes_are_refused_on_transformerlens():
+    # interp_engine implements them too: its parity with nnsight is in test_head_loadings_interp_engine.py
+    with pytest.raises(ValueError, match="nnsight and interp_engine backends only"):
+        attribute(TOKENS, SimpleNamespace(backend="transformerlens"), freeze_attention=False)  # type: ignore[arg-type]

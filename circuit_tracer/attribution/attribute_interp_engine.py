@@ -42,6 +42,8 @@ def attribute(
     offload: Literal["cpu", "disk", None] = None,
     verbose: bool = False,
     update_interval: int = 4,
+    freeze_attention: bool = True,
+    freeze_norms: bool = True,
 ) -> Graph:
     """Compute an attribution graph for *prompt* using the interp_engine backend.
 
@@ -64,6 +66,11 @@ def attribute(
                  Options are "cpu" (move to CPU), "disk" (save to disk), or None.
         verbose: Whether to show progress information.
         update_interval: Number of batches to process before updating the feature ranking.
+        freeze_attention: Hold attention patterns constant (the default), so edges are exact direct
+            effects. False also credits nodes for changing where attention looks, and edges become
+            first-order.
+        freeze_norms: Hold every norm scale constant (the default), QK norms and the transcoders' own
+            normalized reads included. False makes edges first-order in the scales too.
 
     Returns:
         Graph: Fully dense adjacency (unpruned).
@@ -96,6 +103,8 @@ def attribute(
             offload_handles=offload_handles,
             update_interval=update_interval,
             logger=logger,
+            freeze_attention=freeze_attention,
+            freeze_norms=freeze_norms,
         )
     finally:
         for reload_handle in offload_handles:
@@ -118,6 +127,8 @@ def _run_attribution(
     offload_handles,
     logger,
     update_interval: int = 4,
+    freeze_attention: bool = True,
+    freeze_norms: bool = True,
 ):
     start_time = time.time()
     # Phase 0: precompute
@@ -139,7 +150,11 @@ def _run_attribution(
     # Phase 1: forward pass
     logger.info("Phase 1: Running forward pass")
     phase_start = time.time()
-    with ctx.install_hooks(model):
+    # The regime shapes the graph the forward pass builds, so every backward pass below inherits it.
+    with (
+        model.gradient_regime(freeze_attention=freeze_attention, freeze_norms=freeze_norms),
+        ctx.install_hooks(model),
+    ):
         ctx._resid_activations[-1] = model.forward_trunk(input_ids.expand(batch_size, -1))
     logger.info(f"Forward pass completed in {time.time() - phase_start:.2f}s")
 
@@ -278,6 +293,7 @@ def _run_attribution(
         adjacency_matrix=full_edge_matrix,
         cfg=model.cfg,
         scan_name=model.scan_name,
+        attribution_regime={"freeze_attention": freeze_attention, "freeze_norms": freeze_norms},
     )
 
     total_time = time.time() - start_time

@@ -61,19 +61,22 @@ def attribute(
         verbose: Whether to show progress information.
         update_interval: Number of batches to process before updating the feature ranking.
         freeze_attention: Hold attention patterns constant (the default), so edges are exact direct
-            effects. False (nnsight backend only) also credits nodes for changing where attention
+            effects. False (nnsight and interp_engine backends) also credits nodes for changing where attention
             looks, and edges become first-order.
         freeze_norms: Hold every norm scale constant (the default), QK norms included. False is
-            nnsight backend only.
+            nnsight and interp_engine backends only.
 
     Returns:
         Graph: Fully dense adjacency (unpruned).
     """
 
-    if (not freeze_attention or not freeze_norms) and model.backend != "nnsight":
+    if (not freeze_attention or not freeze_norms) and model.backend not in (
+        "nnsight",
+        "interp_engine",
+    ):
         raise ValueError(
-            "freeze_attention=False and freeze_norms=False are implemented for the nnsight backend only; "
-            f"got backend {model.backend!r}"
+            "freeze_attention=False and freeze_norms=False are implemented for the nnsight and interp_engine "
+            f"backends only; got backend {model.backend!r}"
         )
 
     if model.backend == "interp_engine":
@@ -90,6 +93,8 @@ def attribute(
             offload=offload,
             verbose=verbose,
             update_interval=update_interval,
+            freeze_attention=freeze_attention,
+            freeze_norms=freeze_norms,
         )
     elif model.backend == "nnsight":
         from .attribute_nnsight import attribute as attribute_nnsight

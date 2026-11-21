@@ -31,6 +31,7 @@ What this costs: the freezes are verified numerically at load (:meth:`_verify_fr
 than asserted, because "generic" is a claim about architectures nobody has run yet.
 """
 
+import copy
 import sys
 from collections import defaultdict
 from collections.abc import Sequence
@@ -69,6 +70,12 @@ BACKEND = "interp_engine"
 _PATTERN_TAP = "_ct_pattern_tap"
 _SCALE_TAP = "_ct_scale_tap"
 _INPUT_SCALE_TAP = "_ct_input_scale_tap"
+
+# Flags the freezes consult, set by `InterpEngineReplacementModel.gradient_regime` for the forward passes inside it. A
+# flag rather than a second attention implementation or a hook removed and reinstalled, because the freezes also carry
+# the intervention taps above, and a regime is a property of one call, not of the model.
+_LIVE_PATTERN = "_ct_live_pattern"
+_LIVE_SCALE = "_ct_live_scale"
 
 # Name we register the gradient-frozen attention under. transformers dispatches attention through
 # a global registry keyed by ``config._attn_implementation``, so this has to be a name no other
@@ -158,7 +165,10 @@ def _frozen_eager_attention(module, query, key, value, attention_mask, **kwargs)
     n_rep = getattr(module, "num_key_value_groups", None)
     if n_rep is None:
         n_rep = query.shape[1] // value.shape[1]
-    frozen = torch.matmul(attn_weights.detach(), _repeat_kv(value, n_rep))
+    # With the patterns live (`gradient_regime(freeze_attention=False)`) the same contraction keeps their gradient: the
+    # value is identical either way, so only what attribution credits changes.
+    probs = attn_weights if getattr(module, _LIVE_PATTERN, False) else attn_weights.detach()
+    frozen = torch.matmul(probs, _repeat_kv(value, n_rep))
     frozen = frozen.transpose(1, 2).contiguous()
 
     # Hand the discrepancy to the audit rather than checking it on every forward pass. The
@@ -562,6 +572,8 @@ class InterpEngineReplacementModel(nn.Module):
 
         self._audit = _FreezeAudit()
         self._handles: list[RemovableHandle] = []
+        # True inside `real_model`: the permanent hooks then leave every value and gradient as the model computes it.
+        self._hooks_suspended = False
         self._configure_replacement_model()
 
     # --- construction ---------------------------------------------------------
@@ -619,6 +631,10 @@ class InterpEngineReplacementModel(nn.Module):
 
         EagerModel = _import_eager_model()
         _register_frozen_attention()
+        # A copy, because the model keeps the config it is built from and selecting the frozen attention below writes
+        # to it: a caller's config would otherwise send every other model built from it through this backend's
+        # attention.
+        config = copy.deepcopy(config)
         config._attn_implementation = "eager"
         hf_model = AutoModelForCausalLM.from_config(config)
         engine = EagerModel(
@@ -663,9 +679,11 @@ class InterpEngineReplacementModel(nn.Module):
         """
         for layer in range(self.n_layers):
             setattr(self.arch.attn_module(layer), _PATTERN_TAP, None)
+            setattr(self.arch.attn_module(layer), _LIVE_PATTERN, False)
         for norm in _norm_modules(self.hf_model):
             setattr(norm, _SCALE_TAP, None)
             setattr(norm, _INPUT_SCALE_TAP, None)
+            setattr(norm, _LIVE_SCALE, False)
 
     def _find_pre_sublayer_norms(self) -> list[dict[str, nn.Module]]:
         """Which norm module feeds each sublayer, per layer, found by watching one forward pass.
@@ -795,11 +813,19 @@ class InterpEngineReplacementModel(nn.Module):
         """Register a hook that hands ``fn`` the tensor ``location`` names."""
         module, side = location.module, location.side
         if side == "input":
-            return module.register_forward_pre_hook(
-                lambda _m, args, kwargs: fn(_input_tensor(args, kwargs)[0]), with_kwargs=True
-            )
+
+            def read_input(_m, args, kwargs):
+                if not self._hooks_suspended:
+                    fn(_input_tensor(args, kwargs)[0])
+
+            return module.register_forward_pre_hook(read_input, with_kwargs=True)
         if side == "output":
-            return module.register_forward_hook(lambda _m, _a, output: fn(_hidden(output)))
+
+            def read_output(_m, _a, output):
+                if not self._hooks_suspended:
+                    fn(_hidden(output))
+
+            return module.register_forward_hook(read_output)
 
         assert side == "normalized"
         # The unweighted normalized residual is not any module's output, so it cannot be read --
@@ -812,11 +838,17 @@ class InterpEngineReplacementModel(nn.Module):
         centered = _subtracts_mean(module)
 
         def pre_hook(_m, args, kwargs):
+            if self._hooks_suspended:
+                return None
             x, key = _input_tensor(args, kwargs)
             xf = x.float()
             if centered:
                 xf = xf - xf.mean(-1, keepdim=True)
-            scale = torch.sqrt(xf.pow(2).mean(-1, keepdim=True) + eps).detach()
+            scale = torch.sqrt(xf.pow(2).mean(-1, keepdim=True) + eps)
+            # Live under `gradient_regime(freeze_norms=False)`, like every other norm denominator: the norm is
+            # scale-invariant, so the value is the same either way.
+            if not getattr(module, _LIVE_SCALE, False):
+                scale = scale.detach()
             # This denominator gets its own tap, separate from the one `_freeze_scale` puts on the
             # same module, because it is the one that matters and the other one is not it: by the
             # time `_freeze_scale` runs, this pre-hook has already divided the input through, so
@@ -843,6 +875,8 @@ class InterpEngineReplacementModel(nn.Module):
 
     def _splice_output(self, layer: int) -> Callable:
         def splice(_module, _args, output):
+            if self._hooks_suspended:
+                return None
             acts = _hidden(output)
             self._feature_output_raw[layer] = acts.detach()
             read = self._feature_input_tensors[layer]
@@ -880,6 +914,8 @@ class InterpEngineReplacementModel(nn.Module):
         embed, _ = self.engine.resolve_point("embeddings")
 
         def hook(_module, _args, output):
+            if self._hooks_suspended:
+                return output
             tensor = _hidden(output)
             # Every parameter is frozen, so this tensor is a graph leaf and can be turned into
             # one. It is where token-embedding attributions are read from.
@@ -970,6 +1006,50 @@ class InterpEngineReplacementModel(nn.Module):
 
     def ensure_tokenized(self, prompt: str | torch.Tensor | list[int]) -> torch.Tensor:
         return ensure_tokenized(prompt, self.tokenizer, self.device, str(self.cfg.model_name))
+
+    @contextmanager
+    def gradient_regime(
+        self, freeze_attention: bool = True, freeze_norms: bool = True
+    ) -> Iterator[None]:
+        """Hold the attention patterns and norm scales constant, or leave them live, in the forward passes inside.
+
+        Both freezes are on by default and are what make an attribution graph's edges exact direct effects. With either
+        one off the edges become first-order, as on the nnsight backend: a live pattern also credits a node for changing
+        where attention looks, and a live scale for changing a norm's denominator (the transcoders' own normalized
+        reads included). Forward values are the same in every regime; only gradients differ, and they are fixed by the
+        forward pass, so the backward passes may run after the block ends.
+        """
+        attention = [self.arch.attn_module(layer) for layer in range(self.n_layers)]
+        norms = list(_norm_modules(self.hf_model))
+        try:
+            for module in attention:
+                setattr(module, _LIVE_PATTERN, not freeze_attention)
+            for norm in norms:
+                setattr(norm, _LIVE_SCALE, not freeze_norms)
+            yield
+        finally:
+            for module in attention:
+                setattr(module, _LIVE_PATTERN, False)
+            for norm in norms:
+                setattr(norm, _LIVE_SCALE, False)
+
+    @contextmanager
+    def real_model(self) -> Iterator[PreTrainedModel]:
+        """The causal LM as it computes, for an analysis that needs the real model's gradients rather than the
+        replacement model's.
+
+        Inside, the model runs plain eager attention (its patterns are returned and carry gradient) and the permanent
+        hooks stand aside: no norm scale is frozen, no transcoder reads or splices, and the embeddings are left alone.
+        """
+        previous = self.hf_model.config._attn_implementation
+        self._hooks_suspended = True
+        try:
+            with self.gradient_regime(freeze_attention=False, freeze_norms=False):
+                self.hf_model.set_attn_implementation("eager")
+                yield self.hf_model
+        finally:
+            self.hf_model.set_attn_implementation(previous)
+            self._hooks_suspended = False
 
     @contextmanager
     def zero_softcap(self) -> Iterator[None]:
@@ -1503,6 +1583,9 @@ def _freeze_scale(norm: nn.Module, audit: "_FreezeAudit") -> Callable:
     bias = getattr(norm, "bias", None)
 
     def hook(_module, args, output):
+        # A live scale leaves the norm as it is; a replay still applies, since an intervention asked for it.
+        if getattr(norm, _LIVE_SCALE, False) and getattr(norm, _SCALE_TAP, None) is None:
+            return None
         x = args[0].float()
         if centered:
             x = x - x.mean(-1, keepdim=True)
