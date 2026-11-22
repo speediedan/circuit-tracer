@@ -21,10 +21,10 @@ built on the CPU on purpose.
 """
 
 import torch
-from transformer_lens import HookedTransformerConfig
 
 from circuit_tracer.attribution.targets import LogitTarget
 from circuit_tracer.graph import Graph, find_threshold, prune_graph
+from tests.tl_bridge_configs import graph_config
 
 
 def test_find_threshold_at_one_never_selects_a_zero_score():
@@ -62,7 +62,7 @@ def _two_feature_chain_graph() -> Graph:
     adjacency[logit, 0] = w1  # logit <- f1
     adjacency[logit, 1] = w2  # logit <- f2
 
-    cfg = HookedTransformerConfig.from_dict(
+    cfg = graph_config(
         {
             "n_layers": n_layers,
             "d_model": 8,

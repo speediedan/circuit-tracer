@@ -19,7 +19,9 @@ dependencies = [
     "tokenizers>=0.21.0",
     "torch>=2.0.0",
     "tqdm>=4.60.0",
-    "transformer-lens>=2.16.0,<4",
+    # 4.1 is the first release whose bridge leaves transformers' Gemma attention functions untouched;
+    # 4.0 replaced them process-wide, which breaks the nnsight backend's attention hooks
+    "transformer-lens>=4.1.0",
     "transformers>=4.56.0",
 ]
 

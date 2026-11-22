@@ -1,3 +1,4 @@
+import copy
 import warnings
 from collections import defaultdict
 from collections.abc import Sequence
@@ -7,9 +8,9 @@ from typing import Callable, Literal
 
 import torch
 import torch.nn.functional as F
-from torch import nn
-from transformer_lens import HookedTransformer, HookedTransformerConfig
 from transformer_lens.hook_points import HookPoint
+from transformer_lens.model_bridge import TransformerBridge
+from transformers import AutoModelForCausalLM, AutoTokenizer, PretrainedConfig
 
 from circuit_tracer.attribution.context_transformerlens import AttributionContext
 from circuit_tracer.transcoder import TranscoderSet
@@ -25,46 +26,34 @@ Intervention = tuple[
     int | float | torch.Tensor,
 ]
 
-
-class ReplacementMLP(nn.Module):
-    """Wrapper for a TransformerLens MLP layer that adds in extra hooks"""
-
-    def __init__(self, old_mlp: nn.Module):
-        super().__init__()
-        self.old_mlp = old_mlp
-        self.hook_in = HookPoint()
-        self.hook_out = HookPoint()
-
-    def forward(self, x):
-        x = self.hook_in(x)
-        mlp_out = self.old_mlp(x)
-        return self.hook_out(mlp_out)
+# The bridge's own names for the unembedding's input and output. HookedTransformer had neither,
+# so this model used to wrap the unembedding to add `hook_pre`/`hook_post`; the bridge's
+# `unembed.hook_in` is the final normalized residual and `unembed.hook_out` the logits before
+# any soft cap, which are the two tensors those hooks carried.
+UNEMBED_IN = "unembed.hook_in"
+UNEMBED_OUT = "unembed.hook_out"
 
 
-class ReplacementUnembed(nn.Module):
-    """Wrapper for a TransformerLens Unembed layer that adds in extra hooks"""
-
-    def __init__(self, old_unembed: nn.Module):
-        super().__init__()
-        self.old_unembed = old_unembed
-        self.hook_pre = HookPoint()
-        self.hook_post = HookPoint()
-
-    @property
-    def W_U(self):
-        return self.old_unembed.W_U
-
-    @property
-    def b_U(self):
-        return self.old_unembed.b_U
-
-    def forward(self, x):
-        x = self.hook_pre(x)
-        x = self.old_unembed(x)
-        return self.hook_post(x)
+class _StopAtUnembed(Exception):
+    """Raised at the unembedding's input to end a forward pass that needs no logits."""
 
 
-class TransformerLensReplacementModel(HookedTransformer):
+class TransformerLensReplacementModel(TransformerBridge):
+    """A replacement model on a TransformerLens ``TransformerBridge``.
+
+    TransformerLens 4 removed ``HookedTransformer``, which this model used to subclass. The bridge
+    wraps the HuggingFace model without converting its weights and exposes the same
+    TransformerLens hook names over it, so the replacement model keeps its hooks, freezes and
+    skip connections and only changes how the model is built. The bridge is built by
+    TransformerLens and then given this class, so every bridge method stays available.
+
+    Two names differ from the ``HookedTransformer`` version: the unembedding's hooks are the
+    bridge's own ``unembed.hook_in``/``unembed.hook_out`` (:data:`UNEMBED_IN`,
+    :data:`UNEMBED_OUT`), and a transcoder set's hooks are the bridge's, which carry the
+    HuggingFace tensors (``mlp.hook_in``/``mlp.hook_out`` are the MLP's input and output, and
+    ``ln2.hook_normalized`` the unweighted normalized residual).
+    """
+
     transcoders: TranscoderSet | CrossLayerTranscoder  # Support both types
     feature_input_hook: str
     feature_output_hook: str
@@ -73,24 +62,68 @@ class TransformerLensReplacementModel(HookedTransformer):
     backend: Literal["transformerlens"]
 
     @classmethod
-    def from_config(
+    def from_bridge(
         cls,
-        config: HookedTransformerConfig,
-        transcoders: TranscoderSet | CrossLayerTranscoder,  # Accept both
-        **kwargs,
+        bridge: TransformerBridge,
+        transcoders: TranscoderSet | CrossLayerTranscoder,
     ) -> "TransformerLensReplacementModel":
-        """Create a TransformerLensReplacementModel from a given HookedTransformerConfig and TranscoderSet
+        """Turn a TransformerBridge into a replacement model with the given transcoders, in place.
 
         Args:
-            config (HookedTransformerConfig): the config of the HookedTransformer
+            bridge (TransformerBridge): a bridge over a causal LM, as TransformerLens builds it
+            transcoders (TranscoderSet | CrossLayerTranscoder): the transcoders to splice in
+
+        Returns:
+            TransformerLensReplacementModel: the same object, now a replacement model
+        """
+        if type(bridge) is not TransformerBridge:
+            raise TypeError(
+                f"from_bridge takes a TransformerBridge as TransformerLens builds it, got "
+                f"{type(bridge).__name__}"
+            )
+        bridge.__class__ = cls
+        model: TransformerLensReplacementModel = bridge  # type: ignore[assignment]
+        model._configure_replacement_model(transcoders)
+        return model
+
+    @classmethod
+    def from_config(
+        cls,
+        config: PretrainedConfig,
+        transcoders: TranscoderSet | CrossLayerTranscoder,  # Accept both
+        tokenizer=None,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype = torch.float32,
+        **kwargs,
+    ) -> "TransformerLensReplacementModel":
+        """Create a TransformerLensReplacementModel from a HuggingFace config, with fresh weights.
+
+        Args:
+            config (PretrainedConfig): the HuggingFace config of the causal LM. It is copied, so
+                the caller's config is left as it was.
             transcoders (TranscoderSet): The transcoder set with configuration
+            tokenizer: the tokenizer; loaded from ``config._name_or_path`` when not given
+            device: where to build the model; the default device when None
+            dtype: the model's dtype
+            **kwargs: passed to ``TransformerBridge.boot_transformers``
 
         Returns:
             TransformerLensReplacementModel: The loaded TransformerLensReplacementModel
         """
-        model = cls(config, **kwargs)
-        model._configure_replacement_model(transcoders)
-        return model
+        config = copy.deepcopy(config)
+        config._attn_implementation = "eager"  # type: ignore[attr-defined]
+        hf_model = AutoModelForCausalLM.from_config(config).to(dtype=dtype)
+        if tokenizer is None:
+            tokenizer = AutoTokenizer.from_pretrained(config._name_or_path)  # type: ignore[attr-defined]
+        bridge = TransformerBridge.boot_transformers(
+            config._name_or_path,  # type: ignore[attr-defined]
+            hf_model=hf_model,
+            tokenizer=tokenizer,
+            device=device if device is not None else get_default_device(),
+            dtype=dtype,
+            **kwargs,
+        )
+        return cls.from_bridge(bridge, transcoders)
 
     @classmethod
     def from_pretrained_and_transcoders(
@@ -99,25 +132,21 @@ class TransformerLensReplacementModel(HookedTransformer):
         transcoders: TranscoderSet | CrossLayerTranscoder,  # Accept both
         **kwargs,
     ) -> "TransformerLensReplacementModel":
-        """Create a TransformerLensReplacementModel from the name of HookedTransformer and TranscoderSet
+        """Create a TransformerLensReplacementModel from a HuggingFace model name and transcoders
+
+        The bridge runs the HuggingFace weights as they are (no LayerNorm folding or centering), as
+        the transcoders were trained on them.
 
         Args:
-            model_name (str): the name of the pretrained HookedTransformer
+            model_name (str): the HuggingFace name of the pretrained model
             transcoders (TranscoderSet): The transcoder set with configuration
+            **kwargs: passed to ``TransformerBridge.boot_transformers``
 
         Returns:
             TransformerLensReplacementModel: The loaded TransformerLensReplacementModel
         """
-        model = super().from_pretrained(
-            model_name,
-            fold_ln=False,
-            center_writing_weights=False,
-            center_unembed=False,
-            **kwargs,
-        )
-
-        model._configure_replacement_model(transcoders)
-        return model
+        bridge = TransformerBridge.boot_transformers(model_name, **kwargs)
+        return cls.from_bridge(bridge, transcoders)
 
     @classmethod
     def from_pretrained(  # type:ignore
@@ -131,7 +160,7 @@ class TransformerLensReplacementModel(HookedTransformer):
         """Create a TransformerLensReplacementModel from model name and transcoder config
 
         Args:
-            model_name (str): the name of the pretrained HookedTransformer
+            model_name (str): the HuggingFace name of the pretrained model
             transcoder_set (str): Either a predefined transcoder set name, or a config file
             device (torch.device | None): The device to load the model and transcoders on.
                 If None, uses the default device. Defaults to None.
@@ -141,7 +170,7 @@ class TransformerLensReplacementModel(HookedTransformer):
                 weights are not loaded into memory until needed. Defaults to False.
             lazy_decoder (bool): Whether to lazily load decoder weights. If True, decoder
                 weights are not loaded into memory until needed. Defaults to True.
-            **kwargs: Additional keyword arguments passed to HookedTransformer.from_pretrained
+            **kwargs: Additional keyword arguments passed to ``TransformerBridge.boot_transformers``
 
         Returns:
             TransformerLensReplacementModel: The loaded TransformerLensReplacementModel
@@ -177,18 +206,32 @@ class TransformerLensReplacementModel(HookedTransformer):
         self.skip_transcoder = transcoder_set.skip_connection
         self.scan_name = transcoder_set.scan_name
 
-        for block in self.blocks:
-            block.mlp = ReplacementMLP(block.mlp)  # type: ignore
-
-        self.unembed = ReplacementUnembed(self.unembed)
+        for hook in (self.feature_input_hook, self.original_feature_output_hook):
+            missing = [
+                f"blocks.{layer}.{hook}"
+                for layer in range(self.cfg.n_layers)
+                if f"blocks.{layer}.{hook}" not in self.hook_dict
+            ]
+            if missing:
+                raise ValueError(
+                    f"The transcoders read or write at {hook!r}, which this model's TransformerBridge "
+                    f"does not have ({missing[0]} and {len(missing) - 1} more are missing)."
+                )
 
         self._configure_gradient_flow()
-        self._deduplicate_attention_buffers()
-        self.setup()
+
+    def _hook_point(self, name: str) -> HookPoint:
+        """The HookPoint the bridge resolves ``name`` to (canonical or alias)."""
+        return self.hook_dict[name]
+
+    def _register_hook_point(self, name: str, hook_point: HookPoint) -> None:
+        """Make a HookPoint the model created itself addressable by name, like the bridge's own."""
+        hook_point.name = name
+        self._hook_registry[name] = hook_point
 
     def _configure_gradient_flow(self):
         for layer in range(self.cfg.n_layers):
-            self._configure_skip_connection(self.blocks[layer], self.transcoders, layer)
+            self._configure_skip_connection(self.transcoders, layer)
 
         def stop_gradient(acts, hook):
             return acts.detach()
@@ -201,7 +244,7 @@ class TransformerLensReplacementModel(HookedTransformer):
                 block.ln1_post.hook_scale.add_hook(stop_gradient, is_permanent=True)  # type: ignore
             if hasattr(block, "ln2_post"):
                 block.ln2_post.hook_scale.add_hook(stop_gradient, is_permanent=True)  # type: ignore
-            self.ln_final.hook_scale.add_hook(stop_gradient, is_permanent=True)  # type: ignore
+        self.ln_final.hook_scale.add_hook(stop_gradient, is_permanent=True)  # type: ignore
 
         for param in self.parameters():
             param.requires_grad = False
@@ -210,10 +253,10 @@ class TransformerLensReplacementModel(HookedTransformer):
             acts.requires_grad = True
             return acts
 
-        self.hook_embed.add_hook(enable_gradient, is_permanent=True)  # type: ignore
+        self._hook_point("hook_embed").add_hook(enable_gradient, is_permanent=True)
 
     def _configure_skip_connection(
-        self, block, transcoders: TranscoderSet | CrossLayerTranscoder, layer: int
+        self, transcoders: TranscoderSet | CrossLayerTranscoder, layer: int
     ):
         cached = {}
 
@@ -232,45 +275,57 @@ class TransformerLensReplacementModel(HookedTransformer):
             return grad_hook(skip + (acts - skip).detach())
 
         # add feature input hook
-        output_hook_parts = self.feature_input_hook.split(".")
-        subblock = block
-        for part in output_hook_parts:
-            subblock = getattr(subblock, part)
-        subblock.add_hook(cache_activations, is_permanent=True)
+        self._hook_point(f"blocks.{layer}.{self.feature_input_hook}").add_hook(
+            cache_activations, is_permanent=True
+        )
 
         # add feature output hook and special grad hook
-        output_hook_parts = self.original_feature_output_hook.split(".")
-        subblock = block
-        for part in output_hook_parts:
-            subblock = getattr(subblock, part)
-        subblock.hook_out_grad = HookPoint()
-        subblock.add_hook(
-            partial(add_skip_connection, grad_hook=subblock.hook_out_grad),
+        output_hook = self._hook_point(f"blocks.{layer}.{self.original_feature_output_hook}")
+        grad_hook = HookPoint()
+        output_hook.hook_out_grad = grad_hook
+        self._register_hook_point(f"blocks.{layer}.{self.feature_output_hook}", grad_hook)
+        output_hook.add_hook(
+            partial(add_skip_connection, grad_hook=grad_hook),
             is_permanent=True,
         )
 
-    def _deduplicate_attention_buffers(self):
+    def _hook_names(self) -> list[str]:
+        """Every HookPoint once, by its canonical name (``hook_dict`` also lists the aliases)."""
+        names: dict[int, str] = {}
+        for name, hook_point in self.hook_dict.items():
+            names.setdefault(id(hook_point), hook_point.name or name)
+        return list(names.values())
+
+    def forward_trunk(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Run everything except the unembedding, returning the normalized final residual.
+
+        Attribution runs a wide batch (one row per source node) and never needs logits from it,
+        so materializing ``[batch, pos, vocab]`` would dominate memory for no purpose. The
+        bridge's ``stop_at_layer`` stops before a block, so it cannot stop after the final norm;
+        the pass is ended at the unembedding's input instead, after every hook registered there
+        before this call has run.
         """
-        Share attention buffers across layers to save memory.
+        captured: dict[str, torch.Tensor] = {}
 
-        TransformerLens makes separate copies of the same masks and RoPE
-        embeddings for each layer - This just keeps one copy
-        of each and shares it across all layers.
-        """
+        def stop(acts, hook):
+            captured["resid"] = acts
+            raise _StopAtUnembed
 
-        attn_masks = {}
+        try:
+            # a nested hooks() context removes only its own hook on exit
+            with self.hooks(fwd_hooks=[(UNEMBED_IN, stop)]):
+                self.forward(input_ids)
+        except _StopAtUnembed:
+            pass
+        if "resid" not in captured:
+            raise RuntimeError(
+                f"The forward pass never reached {UNEMBED_IN}, so the trunk has no output"
+            )
+        return captured["resid"]
 
-        for block in self.blocks:
-            attn_masks[block.attn.attn_type] = block.attn.mask  # type: ignore
-            if hasattr(block.attn, "rotary_sin"):
-                attn_masks["rotary_sin"] = block.attn.rotary_sin  # type: ignore
-                attn_masks["rotary_cos"] = block.attn.rotary_cos  # type: ignore
-
-        for block in self.blocks:
-            block.attn.mask = attn_masks[block.attn.attn_type]  # type: ignore
-            if hasattr(block.attn, "rotary_sin"):
-                block.attn.rotary_sin = attn_masks["rotary_sin"]  # type: ignore
-                block.attn.rotary_cos = attn_masks["rotary_cos"]  # type: ignore
+    def _output_softcap(self) -> float:
+        """The logit soft cap the HuggingFace model applies after the unembedding (0 for none)."""
+        return float(getattr(self.original_model.config, "final_logit_softcapping", None) or 0.0)
 
     def _get_activation_caching_hooks(
         self,
@@ -342,12 +397,14 @@ class TransformerLensReplacementModel(HookedTransformer):
 
     @contextmanager
     def zero_softcap(self):
-        current_softcap = self.cfg.output_logits_soft_cap
+        # the HuggingFace model applies the cap after the unembedding, reading its config each call
+        config = self.original_model.config
+        current_softcap = getattr(config, "final_logit_softcapping", None)
         try:
-            self.cfg.output_logits_soft_cap = 0.0
+            config.final_logit_softcapping = None
             yield
         finally:
-            self.cfg.output_logits_soft_cap = current_softcap
+            config.final_logit_softcapping = current_softcap
 
     def ensure_tokenized(self, prompt: str | torch.Tensor | list[int]) -> torch.Tensor:
         """Convert prompt to 1-D tensor of token ids with proper special token handling.
@@ -439,17 +496,23 @@ class TransformerLensReplacementModel(HookedTransformer):
         assert isinstance(tokens, torch.Tensor), "Tokens must be a tensor"
         assert tokens.ndim == 1, "Tokens must be a 1D tensor"
 
-        mlp_in_cache, mlp_in_caching_hooks, _ = self.get_caching_hooks(
-            lambda name: self.feature_input_hook in name
-        )
+        # Named per layer rather than matched by substring: the bridge's hook_dict also lists
+        # aliases, and a substring match would cache an aliased point twice.
+        layers = range(self.cfg.n_layers)
+        in_names = [f"blocks.{layer}.{self.feature_input_hook}" for layer in layers]
+        out_names = [f"blocks.{layer}.{self.feature_output_hook}" for layer in layers]
+        cache: dict[str, torch.Tensor] = {}
 
-        mlp_out_cache, mlp_out_caching_hooks, _ = self.get_caching_hooks(
-            lambda name: self.feature_output_hook in name
-        )
-        logits = self.run_with_hooks(tokens, fwd_hooks=mlp_in_caching_hooks + mlp_out_caching_hooks)
+        def keep(acts, hook, name):
+            cache[name] = acts.detach()
 
-        mlp_in_cache = torch.cat(list(mlp_in_cache.values()), dim=0)
-        mlp_out_cache = torch.cat(list(mlp_out_cache.values()), dim=0)
+        fwd_hooks = [
+            (name, partial(keep, name=name)) for name in [*in_names, *out_names, "hook_embed"]
+        ]
+        logits = self.run_with_hooks(tokens, fwd_hooks=fwd_hooks)
+
+        mlp_in_cache = torch.cat([cache[name] for name in in_names], dim=0)
+        mlp_out_cache = torch.cat([cache[name] for name in out_names], dim=0)
 
         attribution_data = self.transcoders.compute_attribution_components(
             mlp_in_cache, self.zero_positions
@@ -459,7 +522,10 @@ class TransformerLensReplacementModel(HookedTransformer):
         error_vectors = mlp_out_cache - attribution_data["reconstruction"]
 
         error_vectors[:, self.zero_positions] = 0
-        token_vectors = self.W_E[tokens].detach()  # (n_pos, d_model)
+        # The tensor at hook_embed, whose gradient the attribution reads: on Gemma it is the
+        # embedding before or after the sqrt(d_model) normalizer according to where the bridge
+        # places the hook, so it is read rather than rebuilt from W_E.
+        token_vectors = cache["hook_embed"][0]  # (n_pos, d_model)
 
         return AttributionContext(
             activation_matrix=attribution_data["activation_matrix"],
@@ -499,7 +565,9 @@ class TransformerLensReplacementModel(HookedTransformer):
 
         # only freeze outputs in constrained range
         selected_hook_points = []
-        for hook_point, hook_obj in self.hook_dict.items():
+        # canonical names only: a point frozen under two names would be cached and replaced twice
+        for hook_point in self._hook_names():
+            hook_obj = self._hook_point(hook_point)
             if any(
                 hookpoint_to_freeze in hook_point for hookpoint_to_freeze in hookpoints_to_freeze
             ):
@@ -721,15 +789,14 @@ class TransformerLensReplacementModel(HookedTransformer):
 
         def logit_cache_hook(activations, hook):
             # we need to manually apply the softcap (if used by the model), as it comes post-hook
-            if self.cfg.output_logits_soft_cap > 0.0:
-                logits = self.cfg.output_logits_soft_cap * F.tanh(
-                    activations / self.cfg.output_logits_soft_cap
-                )
+            softcap = self._output_softcap()
+            if softcap > 0.0:
+                logits = softcap * F.tanh(activations / softcap)
             else:
                 logits = activations.clone()
             cached_logits.append(logits)
 
-        all_hooks.append(("unembed.hook_post", logit_cache_hook))
+        all_hooks.append((UNEMBED_OUT, logit_cache_hook))
 
         return all_hooks, cached_logits, activation_cache
 
@@ -821,7 +888,7 @@ class TransformerLensReplacementModel(HookedTransformer):
         """Given the input, and a dictionary of features to intervene on, performs the
         intervention, and generates a continuation, along with the logits and activations at
         each generation position.
-        This function accepts all kwargs valid for HookedTransformer.generate(). Note that
+        This function accepts all kwargs valid for TransformerBridge.generate(). Note that
         freeze_attention applies only to the first token generated.
 
         Note that if kv_cache is True (default), generation will be faster, as the model will cache the KVs, and only
@@ -902,9 +969,13 @@ class TransformerLensReplacementModel(HookedTransformer):
         for name, hook in hooks:
             self.add_hook(name, hook)
 
-        self.add_hook("unembed.hook_post", clear_and_add_hooks)
+        self.add_hook(UNEMBED_OUT, clear_and_add_hooks)
 
-        generation: str = self.generate(inputs, **kwargs)  # type:ignore
+        # the bridge's generate reads a 1-D token tensor as a batch of one-token prompts
+        prompt = (
+            inputs.unsqueeze(0) if isinstance(inputs, torch.Tensor) and inputs.ndim == 1 else inputs
+        )
+        generation: str = self.generate(prompt, **kwargs)  # type:ignore
         self.reset_hooks()
 
         logits = torch.cat((logit_cache[0][:, -1:], *open_ended_logits), dim=1)  # type:ignore
@@ -928,5 +999,11 @@ class TransformerLensReplacementModel(HookedTransformer):
         return generation, logits.squeeze(0), activations
 
     def __del__(self):
-        # Prevent memory leaks
-        self.reset_hooks(including_permanent=True)
+        # Prevent memory leaks; a model whose construction failed has no hook registry to reset
+        if "_hook_registry" not in self.__dict__:
+            return
+        try:
+            self.reset_hooks(including_permanent=True)
+        except TypeError:
+            # at interpreter shutdown torch's own module globals may already be gone
+            pass

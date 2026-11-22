@@ -87,7 +87,7 @@ class AttributionContext:
             (f"blocks.{layer}.{feature_input_hook}", partial(_cache, layer=layer))
             for layer in range(self.n_layers)
         ]
-        hooks.append(("unembed.hook_pre", partial(_cache, layer=self.n_layers)))
+        hooks.append(("unembed.hook_in", partial(_cache, layer=self.n_layers)))
         return hooks
 
     def _compute_score_hook(

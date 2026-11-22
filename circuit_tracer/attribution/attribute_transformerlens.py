@@ -149,8 +149,7 @@ def _run_attribution(
     logger.info("Phase 1: Running forward pass")
     phase_start = time.time()
     with ctx.install_hooks(model):
-        residual = model.forward(input_ids.expand(batch_size, -1), stop_at_layer=model.cfg.n_layers)
-        ctx._resid_activations[-1] = model.ln_final(residual)
+        ctx._resid_activations[-1] = model.forward_trunk(input_ids.expand(batch_size, -1))
     logger.info(f"Forward pass completed in {time.time() - phase_start:.2f}s")
 
     if offload:

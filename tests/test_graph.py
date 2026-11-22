@@ -3,12 +3,12 @@ import gc
 import numpy as np
 import pytest
 import torch
-from transformer_lens import HookedTransformerConfig
 
 from circuit_tracer.attribution.targets import LogitTarget
 from circuit_tracer.frontend.graph_models import Node
 from circuit_tracer.graph import Graph, compute_edge_influence, compute_node_influence
 from circuit_tracer.utils import get_default_device
+from tests.tl_bridge_configs import graph_config
 
 
 @pytest.fixture(autouse=True)
@@ -118,7 +118,7 @@ def test_small_graph():
         "NTK_by_parts_high_freq_factor": 4.0,
         "NTK_by_parts_factor": 8.0,
     }
-    cfg = HookedTransformerConfig.from_dict(gemma_small_cfg)
+    cfg = graph_config(gemma_small_cfg)
     test_graph = Graph(
         input_string="ab",
         input_tokens=torch.tensor([0, 1]),
@@ -147,7 +147,7 @@ def test_small_graph():
 
 def test_graph_with_tensor_logit_targets():
     """Test that Graph accepts LogitTarget list format and from_pt handles legacy tensor format."""
-    cfg = HookedTransformerConfig.from_dict(
+    cfg = graph_config(
         {
             "n_layers": 2,
             "d_model": 8,
@@ -246,7 +246,7 @@ def test_graph_serialization_with_logit_targets(logit_targets_input, expected_to
     import tempfile
     import os
 
-    cfg = HookedTransformerConfig.from_dict(
+    cfg = graph_config(
         {
             "n_layers": 2,
             "d_model": 8,
@@ -309,7 +309,7 @@ def test_graph_from_pt_legacy_tensor_format():
     import tempfile
     import os
 
-    cfg = HookedTransformerConfig.from_dict(
+    cfg = graph_config(
         {
             "n_layers": 2,
             "d_model": 8,

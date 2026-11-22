@@ -7,7 +7,7 @@ import pytest
 import torch
 import torch.nn as nn
 from tqdm import tqdm
-from transformer_lens import HookedTransformerConfig
+from transformers import PretrainedConfig
 
 from circuit_tracer import Graph, ReplacementModel
 from circuit_tracer.attribution.attribute_transformerlens import attribute
@@ -17,6 +17,7 @@ from circuit_tracer.replacement_model.replacement_model_transformerlens import (
 from circuit_tracer.transcoder import SingleLayerTranscoder, TranscoderSet
 from circuit_tracer.transcoder.activation_functions import JumpReLU
 from circuit_tracer.utils import get_default_device
+from tests.tl_bridge_configs import gpt2_tokenizer, hf_config_from_tl_dict
 
 
 @pytest.fixture(autouse=True)
@@ -200,12 +201,12 @@ def patch_tokenizer_special_ids(model: TransformerLensReplacementModel, special_
         tokenizer_class.all_special_ids = original_all_special_ids  # type: ignore
 
 
-def load_dummy_gemma_model(cfg: HookedTransformerConfig) -> TransformerLensReplacementModel:
+def load_dummy_gemma_model(cfg: PretrainedConfig) -> TransformerLensReplacementModel:
     transcoders = {
         layer_idx: SingleLayerTranscoder(
-            cfg.d_model, cfg.d_model * 4, JumpReLU(torch.tensor(0.0), 0.1), layer_idx
+            cfg.hidden_size, cfg.hidden_size * 4, JumpReLU(torch.tensor(0.0), 0.1), layer_idx
         )
-        for layer_idx in range(cfg.n_layers)
+        for layer_idx in range(cfg.num_hidden_layers)
     }
     for transcoder in transcoders.values():
         for _, param in transcoder.named_parameters():
@@ -216,7 +217,9 @@ def load_dummy_gemma_model(cfg: HookedTransformerConfig) -> TransformerLensRepla
         feature_input_hook="mlp.hook_in",
         feature_output_hook="mlp.hook_out",
     )
-    model = ReplacementModel.from_config(cfg, transcoder_set)
+    model = ReplacementModel.from_config(
+        cfg, transcoder_set, tokenizer=gpt2_tokenizer(), dtype=cfg.torch_dtype
+    )
     assert isinstance(model, TransformerLensReplacementModel)
 
     for _, param in model.named_parameters():
@@ -300,7 +303,7 @@ def test_small_gemma_model():
         "NTK_by_parts_high_freq_factor": 4.0,
         "NTK_by_parts_factor": 8.0,
     }
-    cfg = HookedTransformerConfig.from_dict(gemma_small_cfg)
+    cfg = hf_config_from_tl_dict(gemma_small_cfg)
     model = load_dummy_gemma_model(cfg)
 
     with patch_tokenizer_special_ids(model, [0]):
@@ -397,7 +400,7 @@ def test_large_gemma_model():
         "NTK_by_parts_high_freq_factor": 4.0,
         "NTK_by_parts_factor": 8.0,
     }
-    cfg = HookedTransformerConfig.from_dict(gemma_large_cfg)
+    cfg = hf_config_from_tl_dict(gemma_large_cfg)
     model = load_dummy_gemma_model(cfg)
 
     with patch_tokenizer_special_ids(model, [0]):
