@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import torch
 import torch.nn as nn
-from transformer_lens import HookedTransformerConfig
+from transformers import PretrainedConfig
 
 from circuit_tracer import ReplacementModel
 from circuit_tracer.attribution.attribute_transformerlens import attribute
@@ -19,6 +19,7 @@ from tests.test_attributions_gemma import (
     verify_feature_edges,
     verify_token_and_error_edges,
 )
+from tests.tl_bridge_configs import gpt2_tokenizer, hf_config_from_tl_dict
 
 
 @pytest.fixture(autouse=True)
@@ -28,12 +29,12 @@ def cleanup_cuda():
     gc.collect()
 
 
-def load_dummy_llama_model(cfg: HookedTransformerConfig, k: int) -> TransformerLensReplacementModel:
+def load_dummy_llama_model(cfg: PretrainedConfig, k: int) -> TransformerLensReplacementModel:
     transcoders = {
         layer_idx: SingleLayerTranscoder(
-            cfg.d_model, cfg.d_model * 4, TopK(k), layer_idx, skip_connection=True
+            cfg.hidden_size, cfg.hidden_size * 4, TopK(k), layer_idx, skip_connection=True
         )
-        for layer_idx in range(cfg.n_layers)
+        for layer_idx in range(cfg.num_hidden_layers)
     }
     for transcoder in transcoders.values():
         for _, param in transcoder.named_parameters():
@@ -44,7 +45,9 @@ def load_dummy_llama_model(cfg: HookedTransformerConfig, k: int) -> TransformerL
         feature_input_hook="mlp.hook_in",
         feature_output_hook="mlp.hook_out",
     )
-    model = ReplacementModel.from_config(cfg, transcoder_set)
+    model = ReplacementModel.from_config(
+        cfg, transcoder_set, tokenizer=gpt2_tokenizer(), dtype=cfg.torch_dtype
+    )
     assert model.tokenizer is not None
 
     for _, param in model.named_parameters():
@@ -125,7 +128,7 @@ def test_small_llama_model():
         "NTK_by_parts_factor": 32.0,
     }
 
-    cfg = HookedTransformerConfig.from_dict(llama_small_cfg)
+    cfg = hf_config_from_tl_dict(llama_small_cfg)
     k = 4
     model = load_dummy_llama_model(cfg, k)
     assert model.tokenizer is not None
@@ -208,7 +211,7 @@ def test_large_llama_model():
         "NTK_by_parts_high_freq_factor": 4.0,
         "NTK_by_parts_factor": 32.0,
     }
-    cfg = HookedTransformerConfig.from_dict(llama_large_cfg)
+    cfg = hf_config_from_tl_dict(llama_large_cfg)
     k = 16
     model = load_dummy_llama_model(cfg, k)
     assert model.tokenizer is not None

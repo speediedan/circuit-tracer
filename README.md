@@ -57,7 +57,7 @@ Locally saved transcoders can be loaded by using `ReplacementModel.from_pretrain
 `serve(data_dir=graph_path, port=port, features_dir='/path/to/local_transcoders/')`
 
 ### Choosing a Backend
-By default, `circuit-tracer` creates a `ReplacementModel` that inherits from the `TransformerLens` `HookedTransformer` class. However, `TransformerLens` does not support all HuggingFace models; it only supports those implemented in `TransformerLens`. 
+By default, `circuit-tracer` creates a `ReplacementModel` on a `TransformerLens` `TransformerBridge` (TransformerLens 4.1 or later), which wraps the HuggingFace model without converting its weights and exposes TransformerLens hook names over it. It supports the architectures `TransformerLens` has a bridge adapter for. 
 
 Creating a `ReplacementModel` with `backend='nnsight'` will create an `nnsight`-backed `ReplacementModel` that inherits from its `LanguageModel` class; this supports most HuggingFace models. That is, you can create an `nnsight` `ReplacementModel` using `ReplacementModel.from_pretrained(model_name, backend='nnsight')`. Note, however, that the `nnsight` backend is still experimental: it is slower and less memory-efficient, and may not provide all of the functionality of the `TransformerLens` version.
 

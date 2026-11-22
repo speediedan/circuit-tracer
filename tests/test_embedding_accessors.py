@@ -13,12 +13,12 @@ TL stores the unembedding as `(d_model, d_vocab)` while the Hugging Face-shaped 
 transpose. `unembed_weight` is `(d_vocab, d_model)` on all three, one row per token, matching what
 `embed_weight` already meant everywhere.
 
-Hermetic: the orientation check builds a randomly initialized 8-dimensional model, and the rest
-inspects classes without instantiating them. No weights, network or GPU.
+The orientation check builds a randomly initialized 8-dimensional model (it needs GPT-2's
+tokenizer, from the cache or the Hub), and the rest inspects classes without instantiating them.
+No weights or GPU.
 """
 
 import torch
-from transformer_lens import HookedTransformerConfig
 
 from circuit_tracer.replacement_model.replacement_model_interp_engine import (
     InterpEngineReplacementModel,
@@ -27,6 +27,9 @@ from circuit_tracer.replacement_model.replacement_model_nnsight import NNSightRe
 from circuit_tracer.replacement_model.replacement_model_transformerlens import (
     TransformerLensReplacementModel,
 )
+from circuit_tracer.transcoder import SingleLayerTranscoder, TranscoderSet
+from circuit_tracer.transcoder.activation_functions import JumpReLU
+from tests.tl_bridge_configs import gpt2_tokenizer, hf_config_from_tl_dict
 
 BACKENDS = [
     TransformerLensReplacementModel,
@@ -60,10 +63,25 @@ def test_every_backend_declares_both_accessors():
 
 def test_transformerlens_accessors_are_vocab_major():
     """The one backend that has to transpose. The other two store `(d_vocab, d_model)` already."""
-    config = HookedTransformerConfig(
-        n_layers=1, d_model=D_MODEL, n_ctx=16, d_head=4, d_vocab=D_VOCAB, act_fn="relu"
+    config = hf_config_from_tl_dict(
+        dict(
+            n_layers=1,
+            d_model=D_MODEL,
+            d_head=4,
+            n_heads=2,
+            d_mlp=16,
+            d_vocab=D_VOCAB,
+            original_architecture="LlamaForCausalLM",
+        )
     )
-    model = TransformerLensReplacementModel(config, tokenizer=None)
+    transcoders = TranscoderSet(
+        {0: SingleLayerTranscoder(D_MODEL, 16, JumpReLU(torch.tensor(0.0), 0.1), 0)},
+        feature_input_hook="mlp.hook_in",
+        feature_output_hook="mlp.hook_out",
+    )
+    model = TransformerLensReplacementModel.from_config(
+        config, transcoders, tokenizer=gpt2_tokenizer(), device="cpu"
+    )
 
     assert tuple(model.W_U.shape) == (D_MODEL, D_VOCAB), (
         "TL's own W_U is expected to be d_model-major"
