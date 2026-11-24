@@ -6,6 +6,8 @@ tests described their small random models as ``HookedTransformerConfig`` dicts; 
 every one, :func:`hf_config_from_tl_dict` reads the fields that shape the model from such a dict.
 """
 
+from typing import Any
+
 import torch
 from transformers import AutoTokenizer, Gemma2Config, LlamaConfig, PretrainedConfig
 
@@ -26,7 +28,7 @@ def hf_config_from_tl_dict(cfg: dict) -> PretrainedConfig:
     Supports the two architectures these tests use. ``torch_dtype`` carries the dict's dtype.
     """
     architecture = cfg["original_architecture"]
-    common = dict(
+    common: dict[str, Any] = dict(
         vocab_size=cfg["d_vocab"],
         hidden_size=cfg["d_model"],
         intermediate_size=cfg["d_mlp"],

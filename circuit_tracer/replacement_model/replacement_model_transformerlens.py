@@ -253,7 +253,7 @@ class TransformerLensReplacementModel(TransformerBridge):
             acts.requires_grad = True
             return acts
 
-        self._hook_point("hook_embed").add_hook(enable_gradient, is_permanent=True)
+        self._hook_point("hook_embed").add_hook(enable_gradient, is_permanent=True)  # type: ignore
 
     def _configure_skip_connection(
         self, transcoders: TranscoderSet | CrossLayerTranscoder, layer: int
@@ -276,7 +276,8 @@ class TransformerLensReplacementModel(TransformerBridge):
 
         # add feature input hook
         self._hook_point(f"blocks.{layer}.{self.feature_input_hook}").add_hook(
-            cache_activations, is_permanent=True
+            cache_activations,  # type: ignore
+            is_permanent=True,
         )
 
         # add feature output hook and special grad hook
@@ -285,7 +286,7 @@ class TransformerLensReplacementModel(TransformerBridge):
         output_hook.hook_out_grad = grad_hook
         self._register_hook_point(f"blocks.{layer}.{self.feature_output_hook}", grad_hook)
         output_hook.add_hook(
-            partial(add_skip_connection, grad_hook=grad_hook),
+            partial(add_skip_connection, grad_hook=grad_hook),  # type: ignore
             is_permanent=True,
         )
 
@@ -398,13 +399,13 @@ class TransformerLensReplacementModel(TransformerBridge):
     @contextmanager
     def zero_softcap(self):
         # the HuggingFace model applies the cap after the unembedding, reading its config each call
-        config = self.original_model.config
+        config: PretrainedConfig = self.original_model.config  # type: ignore
         current_softcap = getattr(config, "final_logit_softcapping", None)
         try:
-            config.final_logit_softcapping = None
+            config.final_logit_softcapping = None  # type: ignore
             yield
         finally:
-            config.final_logit_softcapping = current_softcap
+            config.final_logit_softcapping = current_softcap  # type: ignore
 
     def ensure_tokenized(self, prompt: str | torch.Tensor | list[int]) -> torch.Tensor:
         """Convert prompt to 1-D tensor of token ids with proper special token handling.
@@ -509,7 +510,7 @@ class TransformerLensReplacementModel(TransformerBridge):
         fwd_hooks = [
             (name, partial(keep, name=name)) for name in [*in_names, *out_names, "hook_embed"]
         ]
-        logits = self.run_with_hooks(tokens, fwd_hooks=fwd_hooks)
+        logits = self.run_with_hooks(tokens, fwd_hooks=fwd_hooks)  # type: ignore
 
         mlp_in_cache = torch.cat([cache[name] for name in in_names], dim=0)
         mlp_out_cache = torch.cat([cache[name] for name in out_names], dim=0)

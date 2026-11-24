@@ -307,7 +307,7 @@ def test_disk_offload_module_with_a_parameter_under_two_names():
     reload_handle()
 
     assert module.gate.original is module.component
-    assert module.gate.original.weight is module.component.weight
+    assert module.gate.original.weight is module.component.weight  # type: ignore
     torch.testing.assert_close(module.component.weight, weight)
     torch.testing.assert_close(module.component.bias, bias)
     assert module.component.weight.device.type == "cpu"

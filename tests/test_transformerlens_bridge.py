@@ -66,7 +66,7 @@ def _random_hf_model(config) -> nn.Module:
     return hf_model.eval()
 
 
-def _tl_model(hf_model, tokenizer, transcoders) -> TransformerLensReplacementModel:
+def _tl_model(hf_model: Any, tokenizer, transcoders) -> TransformerLensReplacementModel:
     bridge = TransformerBridge.boot_transformers(
         hf_model.config._name_or_path, hf_model=hf_model, tokenizer=tokenizer, device="cpu"
     )
@@ -94,15 +94,15 @@ def test_edges_into_a_logit_sum_to_it(architecture):
     transcoders = _transcoders(8, 2, "mlp.hook_in", "mlp.hook_out")
     model = _tl_model(_random_hf_model(config), gpt2_tokenizer(), transcoders)
     if architecture == "Gemma2ForCausalLM":
-        normalizer = float(model.original_model.model.config.hidden_size) ** 0.5
+        normalizer = float(config.hidden_size) ** 0.5
         assert normalizer > 1.0, "the embedding is not scaled; the test would be vacuous"
     with torch.no_grad():
-        for transcoder in model.transcoders:  # nothing outside the nodes: no decoder bias
+        for transcoder in transcoders:  # nothing outside the nodes: no decoder bias
             transcoder.b_dec.zero_()
     model.zero_positions = slice(0, 0)
 
     with _SpecialIds(model.tokenizer):
-        target = CustomTarget("logit_3", 1.0, model.unembed_weight.detach()[3])
+        target = CustomTarget("logit_3", 1.0, model.W_U.detach()[:, 3])
         graph = attribute(TOKENS, model, attribution_targets=[target], batch_size=16)
         logits, _ = model.get_activations(TOKENS)
 
@@ -121,7 +121,8 @@ def test_the_graph_is_the_nnsight_backends_on_the_same_weights():
     tokenizer = AutoTokenizer.from_pretrained(config._name_or_path)
 
     nnsight_model: Any = NNSightReplacementModel.from_config(
-        copy.deepcopy(config), copy.deepcopy(transcoders)
+        copy.deepcopy(config),  # type: ignore
+        copy.deepcopy(transcoders),
     )
     # nnsight attaches the transcoders to the HF module, so they are the only keys the copy lacks
     missing, unexpected = nnsight_model._module.load_state_dict(hf_model.state_dict(), strict=False)
@@ -163,6 +164,7 @@ def test_each_generated_step_is_the_intervened_forward_of_its_prefix():
     layer, pos, feature = (int(x) for x in activations.nonzero()[-1])
     interventions = [(layer, slice(pos, None), feature, 0.0)]
 
+    generated: Any
     generated, logits, _ = model.feature_intervention_generate(
         TOKENS,
         interventions,
@@ -174,7 +176,9 @@ def test_each_generated_step_is_the_intervened_forward_of_its_prefix():
     new_tokens = generated[0, len(TOKENS) :]
     assert logits.shape == (3, config.vocab_size)
     assert torch.equal(logits.argmax(-1), new_tokens)
-    plain = model.generate(TOKENS.unsqueeze(0), max_new_tokens=3, do_sample=False, verbose=False)
+    plain: Any = model.generate(
+        TOKENS.unsqueeze(0), max_new_tokens=3, do_sample=False, verbose=False
+    )
     assert not torch.equal(plain[0, len(TOKENS) :], new_tokens), "the intervention changed nothing"
 
     prefix = TOKENS
@@ -207,5 +211,5 @@ def test_disk_offload_gives_the_graph_of_no_offload(tied):
     torch.testing.assert_close(offloaded.adjacency_matrix, graph.adjacency_matrix)
     torch.testing.assert_close(again.adjacency_matrix, graph.adjacency_matrix)
     assert all(param.device.type == "cpu" for param in model.parameters())
-    hf_model = model.original_model
+    hf_model: Any = model.original_model
     assert (hf_model.lm_head.weight is hf_model.model.embed_tokens.weight) == tied
