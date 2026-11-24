@@ -28,8 +28,8 @@ def test_offload_tl():
     model = ReplacementModel.from_pretrained("google/gemma-2-2b", "gemma")
     assert isinstance(model, TransformerLensReplacementModel)
 
-    original_device = model.cfg.device  # type:ignore
-    assert isinstance(original_device, torch.device)
+    # A TransformerBridge records its device as a string.
+    original_device = torch.device(model.cfg.device)  # type:ignore
 
     graph_none = attribute_tl(s, model, offload=None)
     graph_cpu = attribute_tl(s, model, offload="cpu")
