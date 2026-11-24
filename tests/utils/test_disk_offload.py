@@ -286,6 +286,64 @@ def test_cpu_offload_tied_embeddings_cuda():
     assert unembed.weight is embed.weight
 
 
+class _AliasedMlp(torch.nn.Module):
+    """One linear layer reachable under two names, as a TransformerBridge MLP's component is."""
+
+    def __init__(self):
+        super().__init__()
+        self.component = torch.nn.Linear(8, 16)
+        self.gate = torch.nn.Module()
+        self.gate.original = self.component
+
+
+@pytest.mark.requires_disk
+def test_disk_offload_module_with_a_parameter_under_two_names():
+    """A parameter a state dict lists twice is saved once and comes back under both names, still one parameter."""
+    module = _AliasedMlp()
+    weight, bias = module.component.weight.detach().clone(), module.component.bias.detach().clone()
+
+    (reload_handle,) = offload_modules(module, "disk")
+    assert module.component.weight.device.type == "meta"
+    reload_handle()
+
+    assert module.gate.original is module.component
+    assert module.gate.original.weight is module.component.weight
+    torch.testing.assert_close(module.component.weight, weight)
+    torch.testing.assert_close(module.component.bias, bias)
+    assert module.component.weight.device.type == "cpu"
+
+
+@pytest.mark.requires_disk
+def test_disk_offload_restores_a_non_persistent_buffer():
+    """A buffer left out of the state dict (Gemma's embedding scale) comes back with the module."""
+    module = torch.nn.Linear(8, 16)
+    module.register_buffer("scale", torch.tensor(2.5), persistent=False)
+
+    (reload_handle,) = offload_modules(module, "disk")
+    reload_handle()
+
+    assert module.scale.device.type == "cpu"
+    torch.testing.assert_close(module.scale, torch.tensor(2.5))
+    assert "scale" not in module.state_dict()
+
+
+@pytest.mark.requires_disk
+@pytest.mark.parametrize("reload_first", [0, 1])
+def test_disk_offload_tied_modules_share_one_parameter_again(reload_first):
+    """A tied embedding and unembedding come back from disk as one parameter, in either reload order."""
+    embed = torch.nn.Embedding(16, 8)
+    unembed = torch.nn.Linear(8, 16, bias=False)
+    unembed.weight = embed.weight
+    weight = embed.weight.detach().clone()
+
+    handles = offload_modules([unembed, embed], "disk")
+    for handle in (handles[reload_first], handles[1 - reload_first]):
+        handle()
+
+    assert unembed.weight is embed.weight
+    torch.testing.assert_close(embed.weight, weight)
+
+
 @pytest.mark.requires_disk
 def test_cleanup_offload_files(clt_module):
     """Test cleanup removes offload files."""
