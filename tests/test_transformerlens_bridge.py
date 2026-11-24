@@ -182,3 +182,30 @@ def test_each_generated_step_is_the_intervened_forward_of_its_prefix():
         expected, _ = model.feature_intervention(prefix, interventions, freeze_attention=False)
         torch.testing.assert_close(logits[step], expected[0, -1], atol=1e-5, rtol=1e-5)
         prefix = torch.cat([prefix, new_tokens[step : step + 1]])
+
+
+@pytest.mark.requires_disk
+@pytest.mark.parametrize("tied", [True, False])
+def test_disk_offload_gives_the_graph_of_no_offload(tied):
+    """A bridge lists its MLP weights twice and shares a tied embedding: disk offload handles both."""
+    torch.manual_seed(1)
+    config = _config("Gemma2ForCausalLM")
+    config.tie_word_embeddings = tied
+    model = _tl_model(
+        _random_hf_model(config),
+        gpt2_tokenizer(),
+        _transcoders(8, 2, "mlp.hook_in", "mlp.hook_out"),
+    )
+    names = {name for name, _ in model.named_parameters(remove_duplicate=False)}
+    assert len(names) > len(dict(model.named_parameters())), "no weight is listed twice"
+
+    with _SpecialIds(model.tokenizer):
+        graph = attribute(TOKENS, model, batch_size=16, offload=None)
+        offloaded = attribute(TOKENS, model, batch_size=16, offload="disk")
+        again = attribute(TOKENS, model, batch_size=16, offload=None)
+
+    torch.testing.assert_close(offloaded.adjacency_matrix, graph.adjacency_matrix)
+    torch.testing.assert_close(again.adjacency_matrix, graph.adjacency_matrix)
+    assert all(param.device.type == "cpu" for param in model.parameters())
+    hf_model = model.original_model
+    assert (hf_model.lm_head.weight is hf_model.model.embed_tokens.weight) == tied
