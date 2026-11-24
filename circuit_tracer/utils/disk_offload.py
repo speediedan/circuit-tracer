@@ -28,8 +28,8 @@ def cleanup_all_offload_files():
     return n_removed
 
 
-def disk_offload_module(module):
-    org_device = next(module.parameters()).device
+def disk_offload_module(module, org_device=None):
+    org_device = org_device or next(module.parameters()).device
     # safetensors opens the path itself, and Windows refuses a second open of a file still held
     # open, so the descriptor is closed before anything is written.
     fd, path = tempfile.mkstemp(prefix=_TEMP_PREFIX)
@@ -53,8 +53,8 @@ def disk_offload_module(module):
     return reload_handle
 
 
-def cpu_offload_module(module):
-    org_device = next(module.parameters()).device
+def cpu_offload_module(module, org_device=None):
+    org_device = org_device or next(module.parameters()).device
     module.to(device="cpu")
 
     def reload_handle():
@@ -80,9 +80,13 @@ def offload_modules(
     offload_fn = disk_offload_module if offload_type == "disk" else cpu_offload_module
 
     if isinstance(modules, nn.ModuleDict):
-        mods = modules.values()
+        mods = list(modules.values())
     elif isinstance(modules, (list, nn.ModuleList, nn.Sequential)):
-        mods = modules
+        mods = list(modules)
     else:
         mods = [modules]
-    return [offload_fn(module) for module in mods]
+    # Read every device before moving anything. A tied embedding and unembedding share one
+    # parameter, so offloading the first moves the second's too; read afterwards, the second's
+    # device would be "cpu", and reloading it would put the shared weight back on the CPU.
+    org_devices = [next(module.parameters()).device for module in mods]
+    return [offload_fn(module, device) for module, device in zip(mods, org_devices)]
