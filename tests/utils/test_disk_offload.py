@@ -2,6 +2,7 @@
 
 import gc
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -241,6 +242,48 @@ def test_offload_modules(modules_factory, expected_count, offload_type):
     if offload_type == "disk":
         for handle in handles:
             handle()
+
+
+class _SharesAParameter:
+    """Stands in for one of two modules holding the same parameter, on a device this host may not have.
+
+    ``Module.to`` moves a shared parameter for every module that holds it, which is what a tied
+    embedding and unembedding do.
+    """
+
+    def __init__(self, param):
+        self._param = param
+
+    def parameters(self):
+        return iter([self._param])
+
+    def to(self, device):
+        self._param.device = torch.device(device)
+
+
+def test_cpu_offload_returns_tied_modules_to_their_device():
+    """Both reloads put a shared parameter back where it was before either module was offloaded."""
+    shared = SimpleNamespace(device=torch.device("cuda:0"))
+    tied: list = [_SharesAParameter(shared), _SharesAParameter(shared)]
+    handles = offload_modules(tied, "cpu")
+    assert shared.device == torch.device("cpu")
+
+    for handle in handles:
+        handle()
+    assert shared.device == torch.device("cuda:0")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_cpu_offload_tied_embeddings_cuda():
+    """A tied embedding and unembedding come back to CUDA, still sharing one parameter."""
+    embed = torch.nn.Embedding(16, 8, device="cuda")
+    unembed = torch.nn.Linear(8, 16, bias=False, device="cuda")
+    unembed.weight = embed.weight
+
+    for handle in offload_modules([unembed, embed], "cpu"):
+        handle()
+    assert embed.weight.device.type == "cuda"
+    assert unembed.weight is embed.weight
 
 
 @pytest.mark.requires_disk
