@@ -387,9 +387,10 @@ def load_large_gpt_oss_model_with_dummy_clt():
     gpt_oss_large_cfg.num_attention_heads = 16
     gpt_oss_large_cfg.num_key_value_heads = 16
     gpt_oss_large_cfg.pad_token_id = 127
-    gpt_oss_large_cfg.torch_dtype = (
-        "float32"  # transformers v5 MoE integration layer doesn't support float64
-    )
+    gpt_oss_large_cfg.torch_dtype = "float64"
+    # transformers v5's default experts kernel (grouped_mm) rejects float64, and its eager loop
+    # accepts it. transformers v4 has no experts interface and never reads this attribute.
+    gpt_oss_large_cfg._experts_implementation = "eager"
 
     clt = CrossLayerTranscoder(
         n_layers=gpt_oss_large_cfg.num_hidden_layers,
@@ -486,7 +487,9 @@ def test_large_gpt_oss_model():
     gpt_oss_large_cfg.num_attention_heads = 16
     gpt_oss_large_cfg.num_key_value_heads = 16
     gpt_oss_large_cfg.pad_token_id = 127
-    gpt_oss_large_cfg.torch_dtype = "float32"  # transformers v5 MoE doesn't support float64
+    gpt_oss_large_cfg.torch_dtype = "float64"
+    # The eager experts loop accepts float64 (see load_large_gpt_oss_model_with_dummy_clt).
+    gpt_oss_large_cfg._experts_implementation = "eager"
     model = load_dummy_gpt_oss_model(gpt_oss_large_cfg)  # type:ignore
 
     # Save original property to restore later

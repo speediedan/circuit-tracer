@@ -83,7 +83,9 @@ class NNSightReplacementModel(TransformersModel):
         hf_model = AutoModelForCausalLM.from_config(config)
         hf_tokenizer = AutoTokenizer.from_pretrained(config._name_or_path)  # type: ignore
 
-        model = cls(hf_model, tokenizer=hf_tokenizer, task="text-generation", dispatch=True, **kwargs)
+        model = cls(
+            hf_model, tokenizer=hf_tokenizer, task="text-generation", dispatch=True, **kwargs
+        )
         model.config = config  # type: ignore
         model._configure_replacement_model(transcoders)
         return model
@@ -555,9 +557,10 @@ class NNSightReplacementModel(TransformersModel):
         attribution_device = self.attribution_device
 
         with self.trace(tokens):
-            # The token nodes' vectors are the embedding location's own output, the tensor whose gradient
-            # attribution reads. Raw embedding rows match it only where the model scales embeddings after
-            # that location; Gemma 3 scales by sqrt(d_model) inside its embedding module.
+            # The token nodes' vectors are the embedding location's own output, the tensor whose
+            # gradient attribution reads. Raw embedding rows match it only where the model scales
+            # embeddings after that location; Gemma 3 scales by sqrt(d_model) inside its embedding
+            # module.
             embedded = save(self.embed_location.output)
             mlp_in_cache, mlp_out_cache = [], []
             for feature_input_loc, feature_output_loc in zip(
@@ -1002,7 +1005,7 @@ class NNSightReplacementModel(TransformersModel):
             direct_effects_barrier = tracer.barrier(2) if constrained_layers else None
 
             with tracer.invoke(trace_inputs):
-                with tracer.iter[:] as act_idx:
+                for act_idx in tracer.iter[:]:
                     current_intervention_layers = (
                         intervention_layers if act_idx == 0 else converted_intervention_layers
                     )
@@ -1024,12 +1027,12 @@ class NNSightReplacementModel(TransformersModel):
 
             for freeze_fn in freeze_fns:
                 with tracer.invoke():
-                    with tracer.iter[:1]:
+                    for _ in tracer.iter[:1]:
                         freeze_fn(direct_effects_barrier=direct_effects_barrier)
 
             all_logits = save(list())  # type: ignore
             with tracer.invoke():
-                with tracer.iter[:] as idx:
+                for idx in tracer.iter[:]:
                     logits = self._perform_feature_intervention(
                         inputs=trace_inputs,
                         interventions=(interventions if idx == 0 else converted_interventions),
@@ -1044,7 +1047,7 @@ class NNSightReplacementModel(TransformersModel):
                     all_logits.append(logits.squeeze(0))
 
             with tracer.invoke():
-                out = save(self.generator.output)
+                out = save(tracer.result)
         return (
             str(tokenizer.decode(out.squeeze(0))),
             torch.cat(all_logits, dim=0),

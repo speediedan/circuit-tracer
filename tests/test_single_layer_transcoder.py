@@ -155,32 +155,44 @@ def test_sparse_encode_decode(create_test_transcoder_file):
     assert len(scaled_decoders) == sparse_acts._nnz()
 
 
-def test_decoder_slice_access(create_test_transcoder_file):
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "mps",
+            marks=pytest.mark.skipif(
+                not torch.backends.mps.is_available(), reason="MPS not available"
+            ),
+        ),
+    ],
+)
+def test_decoder_slice_access(device, create_test_transcoder_file):
     """Test _get_decoder_vectors with both lazy and eager decoder."""
     path, expected_state = create_test_transcoder_file(d_model=128, d_sae=512)
 
     # Test eager decoder
     eager_transcoder = load_transcoder(
-        path, layer=0, lazy_encoder=True, lazy_decoder=False, device=torch.device("cpu")
+        path, layer=0, lazy_encoder=True, lazy_decoder=False, device=torch.device(device)
     )
 
     # Test lazy decoder
     lazy_transcoder = load_transcoder(
-        path, layer=0, lazy_encoder=True, lazy_decoder=True, device=torch.device("cpu")
+        path, layer=0, lazy_encoder=True, lazy_decoder=True, device=torch.device(device)
     )
 
     # Test full access
     eager_full = eager_transcoder._get_decoder_vectors()
     lazy_full = lazy_transcoder._get_decoder_vectors()
     assert torch.allclose(eager_full, lazy_full)
-    assert torch.allclose(eager_full, expected_state["W_dec"])
+    assert torch.allclose(eager_full.cpu(), expected_state["W_dec"])
 
     # Test slice access
     indices = torch.tensor([10, 50, 100, 200])
     eager_slice = eager_transcoder._get_decoder_vectors(indices)
     lazy_slice = lazy_transcoder._get_decoder_vectors(indices)
     assert torch.allclose(eager_slice, lazy_slice)
-    assert torch.allclose(eager_slice, expected_state["W_dec"][indices])
+    assert torch.allclose(eager_slice.cpu(), expected_state["W_dec"][indices])
 
 
 def test_encode_decode_operations(create_test_transcoder_file):
@@ -290,3 +302,44 @@ def test_lazy_loading_both(create_test_transcoder_file):
     assert W_dec.shape == expected_state["W_dec"].shape
     assert torch.allclose(W_enc, expected_state["W_enc"])
     assert torch.allclose(W_dec, expected_state["W_dec"])
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "mps",
+            marks=pytest.mark.skipif(
+                not torch.backends.mps.is_available(), reason="MPS not available"
+            ),
+        ),
+    ],
+)
+def test_load_transcoder_casts_to_dtype(device, tmp_path):
+    """A bf16 file loaded as fp32 matches the file and lands on the requested device."""
+    d_model, d_sae = 128, 512
+    state_dict = {
+        "W_enc": torch.randn(d_sae, d_model),
+        "W_dec": torch.randn(d_sae, d_model),
+        "b_enc": torch.randn(d_sae),
+        "b_dec": torch.randn(d_model),
+    }
+    state_dict = {name: value.to(torch.bfloat16) for name, value in state_dict.items()}
+    path = str(tmp_path / "transcoder.safetensors")
+    save_file(state_dict, path)
+
+    transcoder = load_transcoder(
+        path,
+        layer=0,
+        device=torch.device(device),
+        dtype=torch.float32,
+        lazy_encoder=False,
+        lazy_decoder=False,
+    )
+
+    for name, value in state_dict.items():
+        param = getattr(transcoder, name)
+        assert param.device.type == device
+        assert param.dtype == torch.float32
+        assert torch.equal(param.cpu(), value.float())

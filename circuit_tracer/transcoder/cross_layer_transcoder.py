@@ -229,8 +229,9 @@ class CrossLayerTranscoder(torch.nn.Module):
         path = os.path.join(self.clt_path, f"W_dec_{layer_id}.safetensors")
         if isinstance(to_read, torch.Tensor):
             to_read = to_read.cpu()
-        with safe_open(path, framework="pt", device=str(self.device)) as f:
-            return f.get_slice(f"W_dec_{layer_id}")[to_read].to(dtype=self.dtype)
+        read_device = "cpu" if self.device.type == "mps" else str(self.device)
+        with safe_open(path, framework="pt", device=read_device) as f:
+            return f.get_slice(f"W_dec_{layer_id}")[to_read].to(self.device, self.dtype)
 
     def select_decoder_vectors(self, features):
         if not features.is_sparse:
@@ -239,6 +240,13 @@ class CrossLayerTranscoder(torch.nn.Module):
         activations = features.values()
         n_layers = features.shape[0]
         device = features.device
+
+        if activations.numel() == 0:
+            empty_indices = layer_idx.new_empty(0)
+            empty_vectors = activations.new_empty(
+                (0, self.d_model), dtype=torch.promote_types(activations.dtype, self.dtype)
+            )
+            return empty_indices, empty_indices, empty_indices, empty_vectors, empty_indices
 
         pos_ids = []
         layer_ids = []
@@ -282,9 +290,26 @@ class CrossLayerTranscoder(torch.nn.Module):
         return pos_ids, layer_ids, feat_ids, decoder_vectors, encoder_mapping
 
     def compute_reconstruction(
-        self, pos_ids, layer_ids, decoder_vectors, input_acts: torch.Tensor | None = None
+        self,
+        pos_ids,
+        layer_ids,
+        decoder_vectors,
+        input_acts: torch.Tensor | None = None,
+        *,
+        n_pos: int | None = None,
     ):
-        n_pos = pos_ids.max() + 1
+        """Reconstruct all positions, including those with no active features.
+
+        Pass n_pos or input_acts to preserve trailing inactive positions. Without
+        either, nonempty decoder selections retain the inferred-length behavior.
+        """
+        if n_pos is None:
+            if input_acts is not None:
+                n_pos = input_acts.shape[1]
+            elif pos_ids.numel():
+                n_pos = int(pos_ids.max().item()) + 1
+            else:
+                raise ValueError("Empty decoder selections require n_pos or input_acts")
         flat_idx = layer_ids * n_pos + pos_ids
         recon = torch.zeros(
             n_pos * self.n_layers,
@@ -302,7 +327,9 @@ class CrossLayerTranscoder(torch.nn.Module):
 
     def decode(self, features, input_acts: torch.Tensor | None = None):
         pos_ids, layer_ids, feat_ids, decoder_vectors, _ = self.select_decoder_vectors(features)
-        return self.compute_reconstruction(pos_ids, layer_ids, decoder_vectors, input_acts)
+        return self.compute_reconstruction(
+            pos_ids, layer_ids, decoder_vectors, input_acts, n_pos=features.shape[1]
+        )
 
     def compute_skip(self, layer_id: int, inputs):
         if self.W_skip is not None:
@@ -335,10 +362,18 @@ class CrossLayerTranscoder(torch.nn.Module):
                 - encoder_to_decoder_map: Mapping from encoder to decoder indices
         """
         features, encoder_vectors = self.encode_sparse(inputs, zero_positions=zero_positions)
+        if features._nnz() == 0:
+            warnings.warn(
+                "No active features remain after masking positions for attribution. "
+                "Check the input and zero_positions; no feature attributions can be computed.",
+                stacklevel=2,
+            )
         pos_ids, layer_ids, feat_ids, decoder_vectors, encoder_to_decoder_map = (
             self.select_decoder_vectors(features)
         )
-        reconstruction = self.compute_reconstruction(pos_ids, layer_ids, decoder_vectors, inputs)
+        reconstruction = self.compute_reconstruction(
+            pos_ids, layer_ids, decoder_vectors, inputs, n_pos=inputs.shape[1]
+        )
 
         return {
             "activation_matrix": features,
@@ -353,7 +388,8 @@ class CrossLayerTranscoder(torch.nn.Module):
         """Save CLT to safetensors format compatible with lazy loading.
 
         Saves the CLT state dict split across multiple safetensors files:
-        - W_enc_{i}.safetensors: Contains W_enc_{i}, b_enc_{i}, b_dec_{i}, and optionally threshold_{i}
+        - W_enc_{i}.safetensors: Contains W_enc_{i}, b_enc_{i}, b_dec_{i}, and optionally
+          threshold_{i} and W_skip_{i}
         - W_dec_{i}.safetensors: Contains W_dec_{i}
 
         Args:
@@ -370,6 +406,9 @@ class CrossLayerTranscoder(torch.nn.Module):
                 f"b_enc_{i}": self.b_enc[i].cpu(),
                 f"b_dec_{i}": self.b_dec[i].cpu(),
             }
+
+            if self.W_skip is not None:
+                enc_dict[f"W_skip_{i}"] = self.W_skip[i].cpu()
 
             if has_threshold:
                 assert isinstance(self.activation_function, JumpReLU)
@@ -563,12 +602,16 @@ def _load_state_dict(
     with safe_open(os.path.join(clt_path, dec_file), framework="pt", device=str(device)) as f:
         d_transcoder, d_model = f.get_slice("W_enc_0").get_shape()
         has_threshold = "threshold_0" in f.keys()
+        has_skip = "W_skip_0" in f.keys()
 
     # Preallocate tensors
     b_dec = torch.zeros(n_layers, d_model, device=device, dtype=dtype)
     b_enc = torch.zeros(n_layers, d_transcoder, device=device, dtype=dtype)
 
     state_dict = {"b_dec": b_dec, "b_enc": b_enc}
+
+    if has_skip:
+        state_dict["W_skip"] = torch.zeros(n_layers, d_model, d_model, device=device, dtype=dtype)
 
     if has_threshold:
         state_dict["activation_function.threshold"] = torch.zeros(
@@ -585,6 +628,14 @@ def _load_state_dict(
     for i in range(n_layers):
         enc_file = f"W_enc_{i}.safetensors"
         with safe_open(os.path.join(clt_path, enc_file), framework="pt", device=str(device)) as f:
+            if (f"W_skip_{i}" in f.keys()) != has_skip:
+                raise ValueError(
+                    f"Inconsistent skip weights in {enc_file}: all layers must include "
+                    "W_skip weights or none may include them"
+                )
+            if has_skip:
+                state_dict["W_skip"][i] = f.get_tensor(f"W_skip_{i}").to(dtype)
+
             b_dec[i] = f.get_tensor(f"b_dec_{i}").to(dtype)
             b_enc[i] = f.get_tensor(f"b_enc_{i}").to(dtype)
 

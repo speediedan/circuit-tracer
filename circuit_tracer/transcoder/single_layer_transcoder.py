@@ -114,8 +114,9 @@ class SingleLayerTranscoder(nn.Module):
 
         if isinstance(to_read, torch.Tensor):
             to_read = to_read.cpu()
-        with safe_open(self.transcoder_path, framework="pt", device=str(self.device)) as f:
-            return f.get_slice("W_dec")[to_read].to(self.dtype)
+        read_device = "cpu" if self.device.type == "mps" else str(self.device)
+        with safe_open(self.transcoder_path, framework="pt", device=read_device) as f:
+            return f.get_slice("W_dec")[to_read].to(self.device, self.dtype)
 
     def encode(self, input_acts, apply_activation_function: bool = True):
         W_enc = self.W_enc
@@ -457,7 +458,10 @@ def load_transcoder(
         device = get_default_device()
 
     param_dict = {}
-    with safe_open(path, framework="pt", device=str(device)) as f:
+    # MPS: read and cast on the CPU. Casting on the GPU queues every layer into one Metal
+    # command buffer, which fails silently (all-zero weights) once it exceeds the GPU's working set
+    read_device = "cpu" if torch.device(device).type == "mps" else str(device)
+    with safe_open(path, framework="pt", device=read_device) as f:
         for k in f.keys():
             if lazy_encoder and k == "W_enc":
                 continue
@@ -467,6 +471,10 @@ def load_transcoder(
 
     d_sae = param_dict["b_enc"].shape[0]
     d_model = param_dict["b_dec"].shape[0]
+
+    # `to_safetensors` also writes k for top-k transcoders. It is not a parameter,
+    # and the activation and k are taken from config.yaml, so it is dropped here.
+    param_dict.pop("k", None)
 
     # JumpReLU
     if activation_fn is None:
@@ -489,7 +497,7 @@ def load_transcoder(
             lazy_decoder=lazy_decoder,
         )
     transcoder.load_state_dict(param_dict, assign=True)
-    return transcoder.to(dtype)
+    return transcoder.to(device, dtype)
 
 
 def load_gemma_scope_2_transcoder(
